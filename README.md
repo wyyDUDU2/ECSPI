@@ -1,6 +1,6 @@
 CSP-ECSPI Cotton Early Mapping - GEE JavaScript
 Project Overview
-Google Earth Engine interactive UI code for **Enhanced Cumulative Spectral Phenology Index (ECSPI)** early cotton mapping in Xinjiang (Aksu, Kashgar, Tacheng-Changji). This implementation fully reproduces the paper algorithm, including rainfall noise correction, pixel-wise adaptive phenology extraction, multi-source Sentinel-2 & MODIS fusion, 4 comparison classification pipelines and automatic accuracy evaluation.
+Google Earth Engine interactive UI code for Enhanced Cumulative Spectral Phenology Index (ECSPI) early cotton mapping in Xinjiang (Aksu, Kashgar, Tacheng-Changji). This implementation fully reproduces the paper algorithm, including rainfall noise correction, pixel-wise adaptive phenology extraction, multi-source Sentinel-2 & MODIS fusion, 4 comparison classification pipelines and automatic accuracy evaluation.
 
 Core Functions
 1. Rainfall Adaptive Noise Correction (R1-R4)
@@ -32,7 +32,7 @@ Usage Guide
 7. Export classification results or intermediate CSP/feature layers to Assets
 
 Algorithm Advantage
-The proposed ECSPI (M2) significantly improves separability between cotton and other crops. It realizes cotton identification at squaring stage, 60–70 days earlier than traditional boll-opening period mapping. Unsupervised classification OA reaches 83.03~92.32%,and random forest accuracy up to 96.00~97.77% across 2019–2024 multi-year validation.
+The proposed ECSPI (M2) significantly improves separability between cotton and other crops. It realizes cotton identification at squaring stage, 60–70 days earlier than traditional boll-opening period mapping. Unsupervised classification OA reaches 83.03-92.32%,and random forest accuracy up to 96.00-97.77% across 2019–2024 multi-year validation.
 
 File Structure
 Global parameter configuration: study bounds, scale, phenology DOY defaults
