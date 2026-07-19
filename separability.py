@@ -1,0 +1,2528 @@
+# # # -*- coding: utf-8 -*-
+# # """
+# # ================================================================================
+# # ECSPI / CSP 分离度（M / JM）计算与绘图   —   方法一 & 方法二 完整实现
+# # ================================================================================
+# # 本脚本严格按照 ecspi.txt（GEE JavaScript 棉花制图流程）的算法、参数与思路，
+# # 在 Python（earthengine-api）中完成 **方法一(CSP)** 与 **方法二(ECSPI)** 的
+# # 指数完整计算，并计算棉花 vs 非棉花（含分作物类别）的 M / JM 分离度，最后绘制
+# # 横坐标为“指数值”的、坐标轴统一、标题精简的分离度分布图。
+# #
+# # 关键说明（与原代码完全一致，无任何简化）：
+# #   • 方法一 CSP：直接使用带 "_Noise" 后缀的 asset（逐像素、不去噪、不融合），
+# #     波段 'CSP_s2only'，即 CSP 指数本身。原代码导入逻辑（行 3387-3416）：
+# #         ee.Image(assetId).rename('CSP_s2only').clip(studyArea).updateMask(extendedMask)
+# #   • 方法二 ECSPI：asset 无 "_Noise" 后缀（已降雨去噪重建时序 + 逐像素物候），
+# #     但它是 **融合前** 的 2 波段影像 ['CSP_s2only'(去噪后), 'CSP_MODIS']。
+# #     本脚本据此 **完成自适应加权数据融合**（这正是用户强调“尤其方法二的 ECSPI
+# #     还需要融合”的部分），得到最终 ECSPI（波段 'CSP_fused'）。
+# #   • 融合所需的、且唯一需要在 asset 之外重算的量是 S2 观测密度 s2ObsDensity；
+# #     原代码行 3114 `globalCache.effectiveObsDensity` 被注释掉，故融合权重恒用
+# #     原始 s2ObsDensity（不需要降雨掩膜 / T1T2）。
+# #   • Otsu / Sauvola 阈值分割、最终分类 **不属于指数计算**，也不参与分离度，
+# #     因此不计算 —— 这不是对“指数计算”的简化，而是分离度评估本就不需要的步骤
+# #     （原代码的 computeSeparability 行 1064-1105 也只用指数影像在样本点采样）。
+# #
+# # 分离度的“小地块”策略（满足用户要求，且不改变指数计算的忠实性）：
+# #   • ECSPI / CSP 指数影像均按原代码在 **整个研究区** 的统计量（百分位、z-score
+# #     均值/标准差、残差偏置）一次性构建（统计量作为常量 getInfo 后烘焙进影像），
+# #     因此每个像素的指数值与原流程完全一致；
+# #   • 仅“采样与绘图”被限制到每个研究区自动挑选的 5 个小地块（优先选择 ECSPI 分
+# #     离度明显高于 CSP 的网格），即只缩小“评估范围”，不改变“指数数值”。
+# #
+# # 绘图坐标轴策略（本次修改）：
+# #   • X 轴：仍按 **整个研究区** 统一计算（xlim_csp / xlim_ecspi），即同一研究区内
+# #     所有地块的 CSP 面板共用同一 X 轴范围、所有地块的 ECSPI 面板共用同一 X 轴范围，
+# #     保证“每个区域的 CSP 与 ECSPI 两类图的横坐标严格一致、可横向对比”。
+# #   • Y 轴：改为 **逐地块自适应**（每个地块按本地块两个面板的密度峰值确定 y 上限），
+# #     避免原先“全局统一 y 上限”导致部分图太高、部分图太扁的问题。同一地块的左右
+# #     两个面板共用该地块的 y 上限，便于 CSP 与 ECSPI 直接对比。
+# #
+# # 运行环境：本机需安装 earthengine-api 并已 earthengine authenticate；
+# # 中国大陆访问 GEE 需配置 Clash 代理（默认 http://127.0.0.1:7890，见下方 CONFIG）。
+# #
+# #   pip install earthengine-api numpy matplotlib
+# #
+# # 注意：脚本依赖实时访问 Google Earth Engine 与你账户下的 assets，必须在 **本地**
+# # （开启 Clash、完成 GEE 鉴权）运行；沙箱内无网络/无鉴权，无法执行。
+# # ================================================================================
+# # """
+# #
+# import os
+# import sys
+# import math
+# import json
+# import time
+#
+# # ============================================================================
+# #  CONFIG —— 所有可调参数集中在此
+# # ============================================================================
+#
+# # ---- Clash / 代理（务必在 import ee 之前设置环境变量）-----------------------
+# USE_CLASH_PROXY = True
+# PROXY_URL       = "http://127.0.0.1:7890"   # Clash 默认 HTTP 端口；如不同请修改
+# CLASH_PORT = 7890   # ← 按你的 Clash 实际混合端口修改（常见 7890）
+# os.environ["HTTP_PROXY"]  = f"http://127.0.0.1:{CLASH_PORT}"
+# os.environ["HTTPS_PROXY"] = f"http://127.0.0.1:{CLASH_PORT}"
+# os.environ["ALL_PROXY"]   = f"http://127.0.0.1:{CLASH_PORT}"
+#
+#
+# # ---- GEE 工程与年份 ---------------------------------------------------------
+# EE_PROJECT = "wangyiyao"   # assets 位于 projects/wangyiyao/...
+# YEAR       = 2019          # 与 asset 命名年份一致（例：aksu_CSP_s2only_2019_Noise）
+#
+# # ---- 研究区与边界（与 ecspi.txt regionConfig 一致，[W, S, E, N]）-------------
+# REGIONS = ["aksu", "kashi", "changji"]
+# REGION_BOUNDS = {
+#     "aksu":    [78.0, 40.0, 85.0, 42.5],
+#     "kashi":   [75.5, 37.5, 80.0, 41.0],
+#     "changji": [83.0, 43.5, 89.0, 46.0],
+# }
+#
+# # ---- 样本点 asset（用户提供，权威；用于采样与构建 extendedMask）-------------
+# COTTON_ASSET_PATHS = {
+#     "aksu":    "projects/wangyiyao/assets/aksu_cotton_4000",
+#     "changji": "projects/wangyiyao/assets/changji_cotton_4000",
+#     "kashi":   "projects/wangyiyao/assets/kashi_cotton_3000",
+# }
+# NON_COTTON_ASSET_PATHS = {
+#     "aksu":    "projects/wangyiyao/assets/aksu_noncotton_4000",
+#     "changji": "projects/wangyiyao/assets/changji_noncotton_4000",
+#     "kashi":   "projects/wangyiyao/assets/kashi_noncotton_3000",
+# }
+#
+# # ---- 中间数据 asset 命名（与 getNoiseSuffix() 一致）-------------------------
+# #   方法一(无降雨校正) -> 带 '_Noise'；方法二(降雨校正后) -> 无后缀
+# def m1_asset_id(region, year):   # CSP（方法一）
+#     return "projects/{p}/assets/{r}_CSP_s2only_{y}_Noise".format(p=EE_PROJECT, r=region, y=year)
+# def m2_asset_id(region, year):   # ECSPI 融合前 2 波段（方法二）
+#     return "projects/{p}/assets/{r}_CSP_fused_{y}".format(p=EE_PROJECT, r=region, y=year)
+#
+# # ---- 原代码常量（行内多处）--------------------------------------------------
+# OUTPUT_SCALE    = 10      # outputScale  —— 采样尺度
+# ANALYSIS_SCALE  = 100     # analysisScale —— 统计量尺度
+# TILE_SCALE      = 16      # tileScale
+# COMPOSITE_PERIOD = 10     # 10 天合成周期
+#
+# # ---- 融合统计量范围：'region'=整研究区(最忠实原ECSPI数值, 默认) / 'plot' ----
+# STATS_SCOPE = "region"
+#
+# # ---- 小地块自动搜索参数 -----------------------------------------------------
+# PLOT_SIZE_DEG        = 0.25   # 网格边长(度) ≈ 25km；样本密度较低，宜偏大
+# MIN_COTTON_PTS       = 20     # 网格内最少棉花样本数
+# MIN_NONCOTTON_PTS    = 20     # 网格内最少非棉花样本数
+# MIN_VALS_PER_CLASS   = 15     # 每类、每指数最少有效采样值
+# N_PLOTS_PER_REGION   = 5      # 每研究区选 5 个小地块
+# PREFER_POSITIVE_GAP  = True   # 优先选择 ΔJM=JM_ECSPI-JM_CSP > 0 的网格
+#
+# # ---- 手动指定地块（可选）：region -> [[W,S,E,N], ...]，非空则覆盖自动搜索 ----
+# MANUAL_PLOTS = {
+#     # "aksu": [[80.1, 40.8, 80.35, 41.05], ...],
+# }
+#
+# # ---- 校验：用 GEE aggregate_total_sd 与 numpy(ddof=0) 对比一次 --------------
+# VERIFY_SD = True
+#
+# # ---- 输出目录 ---------------------------------------------------------------
+# OUTPUT_DIR = "/mnt/user-data/outputs"
+# if not os.path.isdir(OUTPUT_DIR):
+#     OUTPUT_DIR = os.path.join(os.getcwd(), "ecspi_outputs")
+#     os.makedirs(OUTPUT_DIR, exist_ok=True)
+#
+# # ---- 绘图配色（英文标签，规避中文字体问题）--------------------------------
+# SUBCAT_DEFS = [   # cropType -> (名称, 颜色)
+#     (2, "Corn",      "#FB8C00"),
+#     (3, "Wheat",     "#FDD835"),
+#     (4, "Orchard",   "#43A047"),
+#     (5, "OtherCrop", "#1E88E5"),
+#     (6, "NonCrop",   "#8E24AA"),
+# ]
+# COTTON_COLOR    = "#E53935"
+# NONCOTTON_COLOR = "#455A64"   # “ALL Noncotton” 汇总曲线
+# REGION_TITLE = {"aksu": "Aksu", "kashi": "Kashi", "changji": "Changji"}
+#
+#
+# # ============================================================================
+# #  代理 + 导入 EE
+# # ============================================================================
+# if USE_CLASH_PROXY:
+#     for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+#         os.environ[k] = PROXY_URL
+#     # gRPC 默认走代理（EE 高级 API 用到）
+#     os.environ.setdefault("grpc_proxy", PROXY_URL)
+#     print("[proxy] Using Clash proxy:", PROXY_URL)
+#
+# try:
+#     import ee
+# except ImportError:
+#     sys.exit("ERROR: earthengine-api 未安装。请先运行: pip install earthengine-api")
+#
+# import numpy as np
+# import matplotlib
+# matplotlib.use("Agg")          # 无显示环境
+# import matplotlib.pyplot as plt
+# from matplotlib.lines import Line2D
+#
+#
+# # ============================================================================
+# #  EE 初始化（含鉴权回退）
+# # ============================================================================
+# def init_ee():
+#     try:
+#         ee.Initialize(project=EE_PROJECT)
+#         print("[ee] Initialized with project:", EE_PROJECT)
+#     except Exception as e:
+#         print("[ee] Initialize failed, trying Authenticate() ...", repr(e))
+#         ee.Authenticate()
+#         ee.Initialize(project=EE_PROJECT)
+#         print("[ee] Initialized after authentication.")
+#
+#
+# def ee_getinfo_retry(obj, retries=4, delay=3.0):
+#     """对 getInfo 做简单重试（网络/代理偶发抖动）。"""
+#     last = None
+#     for i in range(retries):
+#         try:
+#             return obj.getInfo()
+#         except Exception as e:
+#             last = e
+#             print("  [retry %d/%d] getInfo failed: %s" % (i + 1, retries, repr(e)))
+#             time.sleep(delay * (i + 1))
+#     raise last
+#
+#
+# # ============================================================================
+# #  EE 辅助函数（严格照搬 ecspi.txt 行 166-196）
+# # ============================================================================
+# def maskS2Clouds(image):
+#     qa = image.select("QA60")
+#     cloudBitMask = 1 << 10
+#     cirrusBitMask = 1 << 11
+#     qaMask = qa.bitwiseAnd(cloudBitMask).eq(0).And(
+#         qa.bitwiseAnd(cirrusBitMask).eq(0))
+#     scl = image.select("SCL")
+#     sclMask = (scl.neq(3).And(scl.neq(8)).And(scl.neq(9))
+#                   .And(scl.neq(10)).And(scl.neq(11)))
+#     return (image.updateMask(qaMask.And(sclMask))
+#                  .divide(10000)
+#                  .copyProperties(image, ["system:time_start"]))
+#
+#
+# def calculateSI(image):
+#     RE2 = image.select("B6")
+#     RE3 = image.select("B7")
+#     NIR = image.select("B8")
+#     si = RE2.add(RE3).add(NIR).float().rename("SI")
+#     date = ee.Date(image.get("system:time_start"))
+#     doy = date.getRelative("day", "year")
+#     return image.addBands(si).set("DOY", doy).set("date", date.format("YYYY-MM-dd"))
+#
+#
+# def find_key(d, *substrs):
+#     """在 reduceRegion 返回的字典里按子串找 key（鲁棒处理波段名变化）。"""
+#     for k in d.keys():
+#         ok = True
+#         for s in substrs:
+#             if s not in k:
+#                 ok = False
+#                 break
+#         if ok:
+#             return k
+#     return None
+#
+#
+# # ============================================================================
+# #  掩膜构建（严格照搬 ecspi.txt 行 78-115；样本来源改为用户权威 asset）
+# # ============================================================================
+# def build_masks(study_area, cotton_fc, noncotton_fc):
+#     worldCover = ee.ImageCollection("ESA/WorldCover/v100").first().select("Map")
+#     worldCoverClipped = worldCover.clip(study_area)
+#     croplandMask = worldCoverClipped.eq(40)
+#
+#     srtm = ee.Image("USGS/SRTMGL1_003").select("elevation")
+#     elevationMask = srtm.lt(1300).clip(study_area)
+#
+#     comprehensiveMask = (croplandMask.And(elevationMask)
+#                          .rename("mask").clip(study_area)
+#                          .reproject(crs="EPSG:4326", scale=OUTPUT_SCALE))
+#
+#     # 用户样本点（cotton + noncotton）合并，缓冲 150m 栅格化，并入掩膜
+#     allSamplePointsForMask = cotton_fc.merge(noncotton_fc).filterBounds(study_area)
+#     sampleBufferFC = allSamplePointsForMask.map(lambda f: f.buffer(150))
+#     sampleRaster = (ee.Image.constant(1).byte()
+#                     .clip(ee.FeatureCollection(sampleBufferFC))
+#                     .unmask(0).clip(study_area))
+#
+#     extendedMask = (comprehensiveMask.Or(sampleRaster)
+#                     .rename("mask").clip(study_area)
+#                     .reproject(crs="EPSG:4326", scale=OUTPUT_SCALE))
+#     return comprehensiveMask, extendedMask
+#
+#
+# # ============================================================================
+# #  S2 观测密度 s2ObsDensity（严格照搬 ecspi.txt 行 1516-1581）
+# # ============================================================================
+# def compute_obs_density(study_area, extended_mask, year):
+#     dynamicStartDate = "%d-04-01" % year
+#     dynamicEndDate   = "%d-10-31" % year
+#     startDateEE = ee.Date(dynamicStartDate)
+#     endDateEE   = ee.Date(dynamicEndDate)
+#
+#     totalDays  = endDateEE.difference(startDateEE, "day")
+#     numPeriods = totalDays.divide(COMPOSITE_PERIOD).ceil()
+#     periodSeq  = ee.List.sequence(0, numPeriods.subtract(1))
+#
+#     sentinel2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+#                  .filterBounds(study_area)
+#                  .filterDate(dynamicStartDate, dynamicEndDate)
+#                  .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 70)))
+#     s2Masked = sentinel2.map(maskS2Clouds)
+#     s2WithSI = s2Masked.map(calculateSI)
+#
+#     def per_period(periodIndex):
+#         periodIndex = ee.Number(periodIndex)
+#         periodStart = startDateEE.advance(periodIndex.multiply(COMPOSITE_PERIOD), "day")
+#         periodEnd   = periodStart.advance(COMPOSITE_PERIOD, "day")
+#         periodImages = s2WithSI.filterDate(periodStart, periodEnd).select("SI")
+#         hasData = periodImages.size().gt(0)
+#         countImg = ee.Algorithms.If(
+#             hasData,
+#             periodImages.count().float().rename("obs_count"),
+#             ee.Image.constant(0).float().rename("obs_count"))
+#         return ee.Image(countImg)
+#
+#     s2ObsDensity = (ee.ImageCollection.fromImages(periodSeq.map(per_period))
+#                     .sum().rename("total_obs_count")
+#                     .updateMask(extended_mask).clip(study_area))
+#     return s2ObsDensity
+#
+#
+# # ============================================================================
+# #  指数 asset 载入
+# # ============================================================================
+# def load_csp_index(region, year, study_area, extended_mask):
+#     """方法一 CSP：带 _Noise 后缀，波段 'CSP_s2only'（行 3387-3416）。"""
+#     asset = m1_asset_id(region, year)
+#     img = (ee.Image(asset).rename("CSP_s2only")
+#            .clip(study_area).updateMask(extended_mask))
+#     return img
+#
+#
+# def load_prefuse(region, year, study_area, extended_mask):
+#     """方法二 融合前 2 波段：'CSP_s2only'(去噪) + 'CSP_MODIS'（行 4277-4308）。"""
+#     asset = m2_asset_id(region, year)
+#     imported = ee.Image(asset).clip(study_area).updateMask(extended_mask)
+#     csp_s2_denoised = imported.select("CSP_s2only")
+#     csp_modis       = imported.select("CSP_MODIS")
+#     return csp_s2_denoised, csp_modis
+#
+#
+# # ============================================================================
+# #  自适应融合权重（严格照搬 ecspi.txt 行 866-942）
+# # ============================================================================
+# def compute_fusion_weights(csp_s2, csp_modis, s2ObsDensity, mask, obsP10, obsP90):
+#     maskedS2    = csp_s2.updateMask(mask)
+#     maskedModis = csp_modis.updateMask(mask)
+#     # 原代码 effectiveObsDensity 被注释 -> 恒用 s2ObsDensity
+#     maskedObs   = s2ObsDensity.updateMask(mask)
+#
+#     obsP10 = ee.Number(obsP10).max(1)
+#     obsP90 = ee.Number(obsP90).max(3)
+#
+#     # Component 1: Temporal Gap Severity
+#     obsNormalized = (maskedObs.subtract(obsP10)
+#                      .divide(obsP90.subtract(obsP10).max(1)).clamp(0, 1))
+#     sigmoid_k  = 8
+#     sigmoid_x0 = 0.4
+#     gapScore = (ee.Image.constant(1).divide(
+#         ee.Image.constant(1).add(
+#             obsNormalized.subtract(sigmoid_x0).multiply(-sigmoid_k).exp()))
+#         ).rename("gap_score")
+#
+#     # Component 2: Local Spatial Coherence（kernel 与原代码一致：square(3,'pixels')）
+#     localKernel = ee.Kernel.square(3, "pixels")
+#     s2LocalMean = maskedS2.reduceNeighborhood(
+#         reducer=ee.Reducer.mean(), kernel=localKernel, skipMasked=True)
+#     s2LocalStd = maskedS2.reduceNeighborhood(
+#         reducer=ee.Reducer.stdDev(), kernel=localKernel, skipMasked=True)
+#     s2Deviation = maskedS2.subtract(s2LocalMean).abs().divide(s2LocalStd.max(0.001))
+#     s2LocalConfidence = (ee.Image.constant(1).divide(
+#         ee.Image.constant(1).add(s2Deviation))).rename("s2_confidence")
+#
+#     # Component 3: S2-MODIS Consistency（局部均值代替中位数，与原代码一致）
+#     modisLocalMean = maskedModis.reduceNeighborhood(
+#         reducer=ee.Reducer.mean(), kernel=localKernel, skipMasked=True)
+#     s2Sign    = maskedS2.subtract(s2LocalMean)
+#     modisSign = maskedModis.subtract(modisLocalMean)
+#     signAgreement = s2Sign.multiply(modisSign).gt(0).float()
+#     consistencyScore = signAgreement.reduceNeighborhood(
+#         reducer=ee.Reducer.mean(), kernel=localKernel, skipMasked=True
+#     ).rename("consistency")
+#
+#     w_s2 = (gapScore.multiply(0.70)
+#             .add(s2LocalConfidence.multiply(0.15))
+#             .add(consistencyScore.multiply(0.15))
+#             .clamp(0.3, 0.95).rename("w_s2"))
+#
+#     # Safety: 极端缺失区域
+#     extremeGap = maskedObs.lt(obsP10)
+#     w_s2 = w_s2.where(extremeGap, w_s2.min(0.5))
+#     return w_s2.updateMask(mask)
+#
+#
+# # ============================================================================
+# #  融合 + 残差校正 -> ECSPI（严格照搬 ecspi.txt 行 4104-4239）
+# # ============================================================================
+# def fuse_ecspi(csp_s2, csp_modis, fusion_weights, mask, study_area):
+#     # ---- S2 统计（mean+stdDev，scale=100, tileScale=8）----
+#     cspS2Stats = csp_s2.reduceRegion(
+#         reducer=ee.Reducer.mean().combine(reducer2=ee.Reducer.stdDev(), sharedInputs=True),
+#         geometry=study_area, scale=ANALYSIS_SCALE, maxPixels=int(1e13),
+#         bestEffort=True, tileScale=8)
+#     s2Stats = ee_getinfo_retry(cspS2Stats)
+#     k_s2_mean = find_key(s2Stats, "mean")
+#     k_s2_std  = find_key(s2Stats, "stdDev")
+#     cspS2Mean = float(s2Stats[k_s2_mean])
+#     cspS2Std  = max(float(s2Stats[k_s2_std]), 0.0001)
+#
+#     # ---- MODIS 统计（updateMask(extendedMask)）----
+#     cspModisStats = csp_modis.updateMask(mask).reduceRegion(
+#         reducer=ee.Reducer.mean().combine(reducer2=ee.Reducer.stdDev(), sharedInputs=True),
+#         geometry=study_area, scale=ANALYSIS_SCALE, maxPixels=int(1e13),
+#         bestEffort=True, tileScale=8)
+#     modisStats = ee_getinfo_retry(cspModisStats)
+#     k_m_mean = find_key(modisStats, "mean")
+#     k_m_std  = find_key(modisStats, "stdDev")
+#     cspModisMean = float(modisStats[k_m_mean])
+#     cspModisStd  = max(float(modisStats[k_m_std]), 0.0001)
+#
+#     # ---- 对齐 + 加权融合（w_modis 平方阻尼）----
+#     CSP_modis_aligned = (csp_modis.subtract(cspModisMean).divide(cspModisStd)
+#                          .multiply(cspS2Std).add(cspS2Mean))
+#     w_modis = ee.Image.constant(1).subtract(fusion_weights)
+#     w_modis_dampened = w_modis.pow(2)
+#     w_s2_dampened = ee.Image.constant(1).subtract(w_modis_dampened)
+#
+#     fused = (csp_s2.multiply(w_s2_dampened)
+#              .add(CSP_modis_aligned.multiply(w_modis_dampened))
+#              .rename("CSP_fused").updateMask(mask).clip(study_area))
+#
+#     # ---- 残差校正 ----
+#     residual = fused.subtract(csp_s2).rename("CSP_fused")
+#     residualMean = residual.reduceRegion(
+#         reducer=ee.Reducer.mean(), geometry=study_area, scale=ANALYSIS_SCALE,
+#         maxPixels=int(1e13), bestEffort=True, tileScale=8)
+#     resDict = ee_getinfo_retry(residualMean)
+#     k_res = find_key(resDict, "CSP_fused") or (list(resDict.keys())[0] if resDict else None)
+#     resBias = 0.0
+#     if k_res is not None and resDict.get(k_res) is not None:
+#         resBias = float(resDict[k_res])
+#
+#     fusedCorrected = (fused.subtract(ee.Number(resBias * 0.5))
+#                       .rename("CSP_fused").updateMask(mask).clip(study_area))
+#
+#     stats = dict(cspS2Mean=cspS2Mean, cspS2Std=cspS2Std,
+#                  cspModisMean=cspModisMean, cspModisStd=cspModisStd,
+#                  resBias=resBias, bias_correction=resBias * 0.5)
+#     print("    [fuse] S2 mean=%.4f std=%.4f | MODIS mean=%.4f std=%.4f | resBias=%.4f (corr=%.4f)"
+#           % (cspS2Mean, cspS2Std, cspModisMean, cspModisStd, resBias, resBias * 0.5))
+#     return fusedCorrected, stats
+#
+#
+# # ============================================================================
+# #  采样：给样本点加质心经纬度后 sampleRegions，再 getInfo 成 numpy 数组
+# #  （sampleRegions scale=outputScale=10, tileScale=16，与 computeSeparability 一致）
+# # ============================================================================
+# def add_lonlat(fc):
+#     def f(feat):
+#         c = feat.geometry().centroid(maxError=1).coordinates()
+#         return feat.set("plon", ee.Number(c.get(0))).set("plat", ee.Number(c.get(1)))
+#     return fc.map(f)
+#
+#
+# def sample_to_arrays(stacked_img, fc, with_croptype):
+#     props = ["plon", "plat"]
+#     if with_croptype:
+#         props = props + ["cropType"]
+#     sampled = stacked_img.sampleRegions(
+#         collection=fc, properties=props, scale=OUTPUT_SCALE, tileScale=TILE_SCALE)
+#
+#     agg = {
+#         "CSP":   sampled.aggregate_array("CSP"),
+#         "ECSPI": sampled.aggregate_array("ECSPI"),
+#         "plon":  sampled.aggregate_array("plon"),
+#         "plat":  sampled.aggregate_array("plat"),
+#     }
+#     if with_croptype:
+#         agg["cropType"] = sampled.aggregate_array("cropType")
+#
+#     data = ee_getinfo_retry(ee.Dictionary(agg))
+#
+#     out = {
+#         "CSP":   np.array(data.get("CSP", []),   dtype=float),
+#         "ECSPI": np.array(data.get("ECSPI", []), dtype=float),
+#         "lon":   np.array(data.get("plon", []),  dtype=float),
+#         "lat":   np.array(data.get("plat", []),  dtype=float),
+#     }
+#     if with_croptype:
+#         ct = data.get("cropType", [])
+#         out["cropType"] = np.array([(-1 if v is None else v) for v in ct], dtype=float)
+#     return out, sampled
+#
+#
+# # ============================================================================
+# #  分离度 M / JM（严格照搬 ecspi.txt 行 1064-1105；ddof=0 == GEE total_sd）
+# # ============================================================================
+# def separability(a, b):
+#     a = np.asarray(a, dtype=float); b = np.asarray(b, dtype=float)
+#     a = a[np.isfinite(a)]; b = b[np.isfinite(b)]
+#     if len(a) < 2 or len(b) < 2:
+#         return (float("nan"), float("nan"), len(a), len(b))
+#     mu1, mu2 = float(a.mean()), float(b.mean())
+#     d1 = max(float(a.std(ddof=0)), 0.0001)   # GEE aggregate_total_sd = 总体(population) SD
+#     d2 = max(float(b.std(ddof=0)), 0.0001)
+#     M = abs(mu1 - mu2) / (d1 + d2)
+#     v1, v2 = d1 * d1, d2 * d2
+#     B = 0.125 * 2.0 * (mu1 - mu2) ** 2 / (v1 + v2) + 0.5 * math.log((v1 + v2) / (2.0 * d1 * d2))
+#     JM = 2.0 * (1.0 - math.exp(-B))
+#     return (M, JM, len(a), len(b))
+#
+#
+# # ============================================================================
+# #  轻量高斯核密度（自包含，不依赖 scipy）
+# # ============================================================================
+# def gaussian_kde(samples, xs):
+#     samples = np.asarray(samples, dtype=float)
+#     samples = samples[np.isfinite(samples)]
+#     n = samples.size
+#     if n == 0:
+#         return np.zeros_like(xs)
+#     if n == 1:
+#         bw = max((xs.max() - xs.min()) / 50.0, 1e-3)
+#     else:
+#         std = samples.std(ddof=1)
+#         if std <= 0:
+#             std = max((xs.max() - xs.min()) / 50.0, 1e-3)
+#         bw = std * n ** (-1.0 / 5.0)          # Scott's rule
+#         bw = max(bw, (xs.max() - xs.min()) / 200.0, 1e-3)
+#     diff = (xs[None, :] - samples[:, None]) / bw
+#     dens = np.exp(-0.5 * diff ** 2).sum(axis=0) / (n * bw * math.sqrt(2 * math.pi))
+#     return dens
+#
+#
+# # ============================================================================
+# #  地块内每类的取值（按质心落入 bbox 过滤）
+# # ============================================================================
+# def in_bbox(lon, lat, bbox):
+#     w, s, e, n = bbox
+#     return (lon >= w) & (lon < e) & (lat >= s) & (lat < n)
+#
+#
+# def subset_plot(arr, bbox):
+#     m = in_bbox(arr["lon"], arr["lat"], bbox)
+#     out = {"CSP": arr["CSP"][m], "ECSPI": arr["ECSPI"][m],
+#            "lon": arr["lon"][m], "lat": arr["lat"][m]}
+#     if "cropType" in arr:
+#         out["cropType"] = arr["cropType"][m]
+#     return out
+#
+#
+# # ============================================================================
+# #  候选网格生成 + 打分 + 选 Top-N
+# # ============================================================================
+# def generate_candidates(cotton_arr, noncotton_arr):
+#     size = PLOT_SIZE_DEG
+#
+#     def cell_key(lon, lat):
+#         return (int(math.floor(lon / size)), int(math.floor(lat / size)))
+#
+#     # 收集出现过的网格
+#     cells = {}
+#     for lon, lat in zip(cotton_arr["lon"], cotton_arr["lat"]):
+#         if np.isfinite(lon) and np.isfinite(lat):
+#             cells.setdefault(cell_key(lon, lat), True)
+#     for lon, lat in zip(noncotton_arr["lon"], noncotton_arr["lat"]):
+#         if np.isfinite(lon) and np.isfinite(lat):
+#             cells.setdefault(cell_key(lon, lat), True)
+#
+#     candidates = []
+#     for (ix, iy) in cells.keys():
+#         bbox = [ix * size, iy * size, (ix + 1) * size, (iy + 1) * size]
+#         c = subset_plot(cotton_arr, bbox)
+#         o = subset_plot(noncotton_arr, bbox)
+#         nc = int(np.isfinite(c["CSP"]).sum())
+#         no = int(np.isfinite(o["CSP"]).sum())
+#         if (len(c["lon"]) < MIN_COTTON_PTS) or (len(o["lon"]) < MIN_NONCOTTON_PTS):
+#             continue
+#         if nc < MIN_VALS_PER_CLASS or no < MIN_VALS_PER_CLASS:
+#             continue
+#         M_csp,  JM_csp,  _, _ = separability(c["CSP"],   o["CSP"])
+#         M_ecs,  JM_ecs,  _, _ = separability(c["ECSPI"], o["ECSPI"])
+#         if not (np.isfinite(JM_csp) and np.isfinite(JM_ecs)):
+#             continue
+#         candidates.append({
+#             "bbox": bbox, "n_cotton": len(c["lon"]), "n_noncotton": len(o["lon"]),
+#             "CSP_M": M_csp, "CSP_JM": JM_csp, "ECSPI_M": M_ecs, "ECSPI_JM": JM_ecs,
+#             "dM": M_ecs - M_csp, "dJM": JM_ecs - JM_csp,
+#         })
+#
+#     # 排序：优先 ΔJM>0，再按 ΔJM 降序，最后按 ΔM 降序
+#     def sort_key(d):
+#         positive = 1 if (d["dJM"] > 0) else 0
+#         if PREFER_POSITIVE_GAP:
+#             return (positive, d["dJM"], d["dM"])
+#         return (d["dJM"], d["dM"])
+#     candidates.sort(key=sort_key, reverse=True)
+#     return candidates[:N_PLOTS_PER_REGION]
+#
+#
+# def manual_candidates(region, cotton_arr, noncotton_arr):
+#     out = []
+#     for bbox in MANUAL_PLOTS.get(region, []):
+#         c = subset_plot(cotton_arr, bbox)
+#         o = subset_plot(noncotton_arr, bbox)
+#         M_csp, JM_csp, _, _ = separability(c["CSP"], o["CSP"])
+#         M_ecs, JM_ecs, _, _ = separability(c["ECSPI"], o["ECSPI"])
+#         out.append({
+#             "bbox": bbox, "n_cotton": len(c["lon"]), "n_noncotton": len(o["lon"]),
+#             "CSP_M": M_csp, "CSP_JM": JM_csp, "ECSPI_M": M_ecs, "ECSPI_JM": JM_ecs,
+#             "dM": M_ecs - M_csp, "dJM": JM_ecs - JM_csp,
+#         })
+#     return out
+#
+#
+# # ============================================================================
+# #  绘图：每个地块一图、左右两面板（左 CSP / 右 ECSPI），横坐标=指数值
+# #  坐标轴策略：
+# #    • X 轴：由调用方传入的 xlim_csp / xlim_ecspi（整研究区统一）—— 保证同一研究区
+# #      内所有地块的 CSP 面板 X 轴一致、所有地块的 ECSPI 面板 X 轴一致。
+# #    • Y 轴：本函数内 **逐地块自适应**，仅由该地块两个面板的密度峰值决定；同一地块
+# #      的左右面板共用同一 y 上限，便于 CSP 与 ECSPI 直接对比。
+# # ============================================================================
+# def present_subcats(noncotton_plot):
+#     """返回该地块内实际存在的子类别 [(cropType, name, color, mask), ...]"""
+#     res = []
+#     if "cropType" not in noncotton_plot:
+#         return res
+#     ct = noncotton_plot["cropType"]
+#     for code, name, color in SUBCAT_DEFS:
+#         m = (ct == code)
+#         if int(np.isfinite(noncotton_plot["CSP"][m]).sum()) >= 3:
+#             res.append((code, name, color, m))
+#     return res
+#
+#
+# def compute_plot_ymax(c, o, subcats, xlim_csp, xlim_ecspi):
+#     """逐地块的 y 上限：取该地块两个面板（CSP / ECSPI）所有曲线的密度峰值。"""
+#     ymax = 0.0
+#     for key, xlim in [("CSP", xlim_csp), ("ECSPI", xlim_ecspi)]:
+#         xs = np.linspace(xlim[0], xlim[1], 400)
+#         ymax = max(ymax, gaussian_kde(c[key], xs).max(), gaussian_kde(o[key], xs).max())
+#         for _, _, _, m in subcats:
+#             ymax = max(ymax, gaussian_kde(o[key][m], xs).max())
+#     ymax *= 1.12
+#     if not np.isfinite(ymax) or ymax <= 0:
+#         ymax = 1.0
+#     return ymax
+#
+#
+# def plot_one_plot(region, k, cand, cotton_arr, noncotton_arr,
+#                   xlim_csp, xlim_ecspi):
+#     bbox = cand["bbox"]
+#     c = subset_plot(cotton_arr, bbox)
+#     o = subset_plot(noncotton_arr, bbox)
+#     subcats = present_subcats(o)
+#
+#     # ---- 本地块自适应 y 上限（X 轴范围仍由调用方按研究区统一传入）----
+#     ymax = compute_plot_ymax(c, o, subcats, xlim_csp, xlim_ecspi)
+#
+#     # ---- 竖直拼接：CSP 在上、ECSPI 在下 ----
+#     fig, axes = plt.subplots(2, 1, figsize=(8.0, 9.5))
+#     panels = [
+#         (axes[0], "CSP",   "CSP",   xlim_csp,   cand["CSP_M"],   cand["CSP_JM"]),
+#         (axes[1], "ECSPI", "ECSPI", xlim_ecspi, cand["ECSPI_M"], cand["ECSPI_JM"]),
+#     ]
+#
+#     for ax, key, title, xlim, Mval, JMval in panels:
+#         xs = np.linspace(xlim[0], xlim[1], 400)
+#
+#         # 非棉花总体（灰，虚线）
+#         d_all = gaussian_kde(o[key], xs)
+#         ax.plot(xs, d_all, color=NONCOTTON_COLOR, lw=1.6, ls="--",
+#                 label="ALL Noncotton", zorder=2)
+#         ax.fill_between(xs, d_all, color=NONCOTTON_COLOR, alpha=0.06, zorder=1)
+#
+#         # 各子类别（图例不标 JM，只用类别名）
+#         for code, name, color, m in subcats:
+#             d = gaussian_kde(o[key][m], xs)
+#             ax.plot(xs, d, color=color, lw=1.7, label=name, zorder=3)
+#             ax.fill_between(xs, d, color=color, alpha=0.08, zorder=1)
+#
+#         # 棉花（红、加粗、置顶）
+#         d_cot = gaussian_kde(c[key], xs)
+#         ax.plot(xs, d_cot, color=COTTON_COLOR, lw=3.0, label="Cotton", zorder=5)
+#         ax.fill_between(xs, d_cot, color=COTTON_COLOR, alpha=0.12, zorder=4)
+#
+#         # 棉花均值 μ：红色粗虚线 + 数值标注（尽量靠上）
+#         cot_vals = c[key][np.isfinite(c[key])]
+#         if cot_vals.size > 0:
+#             cot_mu = float(cot_vals.mean())
+#             ax.axvline(cot_mu, color=COTTON_COLOR, lw=2.5, ls="--", zorder=6,
+#                        label="Cotton \u03bc")
+#             span = (xlim[1] - xlim[0]) if (xlim[1] > xlim[0]) else 1.0
+#             frac = (cot_mu - xlim[0]) / span
+#             # 水平对齐：μ 在左半 -> 文字放线右侧；在右半 -> 放线左侧
+#             if frac > 0.5:
+#                 ha, dx = "right", -0.012 * span
+#             else:
+#                 ha, dx = "left", 0.012 * span
+#             # 竖直位置：默认靠上；只有落在最右(M/JM框)或最左(图例)才下移让开
+#             mu_y = ymax * 0.90
+#             if frac > 0.72 or frac < 0.20:
+#                 mu_y = ymax * 0.52
+#             ax.text(cot_mu + dx, mu_y, "\u03bc = %.3f" % cot_mu,
+#                     color=COTTON_COLOR, fontsize=10, fontweight="bold",
+#                     ha=ha, va="top", zorder=7,
+#                     bbox=dict(boxstyle="round,pad=0.25", fc="white",
+#                               ec=COTTON_COLOR, alpha=0.9))
+#
+#         # 坐标轴：X 轴=研究区统一范围；Y 轴=本地块自适应
+#         ax.set_xlim(xlim)
+#         ax.set_ylim(0, ymax)
+#         ax.set_title(title, fontsize=13, fontweight="bold")
+#         ax.set_xlabel("Index value")
+#         ax.set_ylabel("Density")
+#         ax.grid(alpha=0.25, lw=0.6)
+#
+#         # 注释：Cotton vs ALL Noncotton 的 M / JM —— 固定右上角，不随数据移动
+#         txt = "Cotton vs Non-cotton\nM  = %.3f\nJM = %.3f" % (Mval, JMval)
+#         ax.text(0.97, 0.96, txt, transform=ax.transAxes, ha="right", va="top",
+#                 fontsize=9.5,
+#                 bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="#999999", alpha=0.92))
+#
+#         ax.legend(fontsize=8, loc="upper left", framealpha=0.85)
+#
+#     dJM = cand["ECSPI_JM"] - cand["CSP_JM"]
+#     sign = "+" if dJM >= 0 else ""
+#     fig.suptitle("%s  -  Plot %d   (cotton n=%d, non-cotton n=%d)   \u0394JM = %s%.3f"
+#                  % (REGION_TITLE.get(region, region), k,
+#                     cand["n_cotton"], cand["n_noncotton"], sign, dJM),
+#                  fontsize=12.5, fontweight="bold")
+#     fig.tight_layout(rect=[0, 0, 1, 0.96])
+#
+#     fname = os.path.join(OUTPUT_DIR, "%s_plot%d_separability.png" % (region, k))
+#     fig.savefig(fname, dpi=160)
+#     plt.close(fig)
+#     return fname
+#
+#
+# def plot_region_summary(region, cands):
+#     """每研究区一张：左 M、右 JM 的分组柱状图（CSP vs ECSPI × 5 地块）。"""
+#     n = len(cands)
+#     idx = np.arange(n)
+#     width = 0.38
+#     fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.4))
+#
+#     for ax, metric, title in [(axes[0], "M", "M-index"),
+#                               (axes[1], "JM", "JM-distance")]:
+#         csp_vals   = [c["CSP_%s" % metric]   for c in cands]
+#         ecspi_vals = [c["ECSPI_%s" % metric] for c in cands]
+#         ax.bar(idx - width / 2, csp_vals,   width, label="CSP",
+#                color="#90A4AE", edgecolor="#546E7A")
+#         ax.bar(idx + width / 2, ecspi_vals, width, label="ECSPI",
+#                color="#E53935", edgecolor="#B71C1C")
+#         ax.set_xticks(idx)
+#         ax.set_xticklabels(["P%d" % (i + 1) for i in range(n)])
+#         ax.set_title(title, fontsize=13, fontweight="bold")
+#         ax.set_xlabel("Plot")
+#         ax.grid(axis="y", alpha=0.25, lw=0.6)
+#         ax.legend(fontsize=9)
+#         if metric == "JM":
+#             ax.set_ylim(0, 2.05)
+#
+#     fig.suptitle("%s  -  Separability summary (CSP vs ECSPI)"
+#                  % REGION_TITLE.get(region, region),
+#                  fontsize=12.5, fontweight="bold")
+#     fig.tight_layout(rect=[0, 0, 1, 0.94])
+#     fname = os.path.join(OUTPUT_DIR, "%s_summary_MJM.png" % region)
+#     fig.savefig(fname, dpi=160)
+#     plt.close(fig)
+#     return fname
+#
+#
+# # ============================================================================
+# #  单研究区主流程
+# # ============================================================================
+# def process_region(region, year, summary_rows, subcat_rows, did_verify_flag):
+#     print("\n" + "=" * 70)
+#     print("REGION: %s   YEAR: %d" % (region, year))
+#     print("=" * 70)
+#
+#     study_area = ee.Geometry.Rectangle(REGION_BOUNDS[region])
+#
+#     # 1) 样本点（用户权威 asset）
+#     cotton_fc = ee.FeatureCollection(COTTON_ASSET_PATHS[region]).filterBounds(study_area)
+#     noncotton_fc = ee.FeatureCollection(NON_COTTON_ASSET_PATHS[region]).filterBounds(study_area)
+#
+#     # 2) 掩膜
+#     print("[1] Building masks ...")
+#     comprehensiveMask, extendedMask = build_masks(study_area, cotton_fc, noncotton_fc)
+#
+#     # 3) 观测密度
+#     print("[2] Computing S2 observation density ...")
+#     s2ObsDensity = compute_obs_density(study_area, extendedMask, year)
+#
+#     # 4) obs 百分位 (p10/p90)
+#     print("[3] Computing obs percentiles (p10/p90) ...")
+#     obsStats = s2ObsDensity.updateMask(extendedMask).reduceRegion(
+#         reducer=ee.Reducer.percentile([10, 90]), geometry=study_area,
+#         scale=ANALYSIS_SCALE, maxPixels=int(1e13), bestEffort=True, tileScale=TILE_SCALE)
+#     od = ee_getinfo_retry(obsStats)
+#     kp10 = find_key(od, "p10"); kp90 = find_key(od, "p90")
+#     p10 = max(float(od[kp10]), 1.0) if (kp10 and od[kp10] is not None) else 1.0
+#     p90 = max(float(od[kp90]), 3.0) if (kp90 and od[kp90] is not None) else 3.0
+#     print("    obs P10=%.2f  P90=%.2f" % (p10, p90))
+#
+#     # 5) 载入 CSP（方法一）
+#     print("[4] Loading CSP (method 1) asset ...")
+#     csp_index = load_csp_index(region, year, study_area, extendedMask)
+#
+#     # 6) 载入融合前 2 波段（方法二）
+#     print("[5] Loading 2-band pre-fusion (method 2) asset ...")
+#     csp_s2_denoised, csp_modis = load_prefuse(region, year, study_area, extendedMask)
+#
+#     # 7) 融合权重
+#     print("[6] Computing adaptive fusion weights ...")
+#     weights = compute_fusion_weights(csp_s2_denoised, csp_modis, s2ObsDensity,
+#                                      extendedMask, p10, p90)
+#
+#     # 8) 融合 -> ECSPI
+#     print("[7] Fusing -> ECSPI (with residual correction) ...")
+#     ecspi, _ = fuse_ecspi(csp_s2_denoised, csp_modis, weights, extendedMask, study_area)
+#
+#     # 9) 叠加成 2 波段，便于一次采样
+#     stacked = ee.Image.cat([csp_index.rename("CSP"), ecspi.rename("ECSPI")])
+#
+#     # 10) 加经纬度 + 采样
+#     print("[8] Sampling at cotton & non-cotton points (region-wide, once) ...")
+#     cotton_fc2    = add_lonlat(cotton_fc)
+#     noncotton_fc2 = add_lonlat(noncotton_fc)
+#     cotton_arr,    cotton_sampled    = sample_to_arrays(stacked, cotton_fc2,    with_croptype=False)
+#     noncotton_arr, noncotton_sampled = sample_to_arrays(stacked, noncotton_fc2, with_croptype=True)
+#     print("    cotton sampled:    CSP=%d  ECSPI=%d" %
+#           (np.isfinite(cotton_arr["CSP"]).sum(), np.isfinite(cotton_arr["ECSPI"]).sum()))
+#     print("    noncotton sampled: CSP=%d  ECSPI=%d" %
+#           (np.isfinite(noncotton_arr["CSP"]).sum(), np.isfinite(noncotton_arr["ECSPI"]).sum()))
+#
+#     # 11) SD 校验（仅一次）：GEE aggregate_total_sd vs numpy ddof=0
+#     if VERIFY_SD and not did_verify_flag["done"]:
+#         try:
+#             gee_sd = ee_getinfo_retry(ee.Number(cotton_sampled.aggregate_total_sd("CSP")))
+#             np_sd = float(cotton_arr["CSP"][np.isfinite(cotton_arr["CSP"])].std(ddof=0))
+#             print("    [VERIFY_SD] GEE total_sd=%.6f  |  numpy ddof=0=%.6f  |  diff=%.2e"
+#                   % (gee_sd, np_sd, abs(gee_sd - np_sd)))
+#         except Exception as e:
+#             print("    [VERIFY_SD] skipped:", repr(e))
+#         did_verify_flag["done"] = True
+#
+#     # 12) 选地块
+#     if MANUAL_PLOTS.get(region):
+#         print("[9] Using MANUAL plots ...")
+#         cands = manual_candidates(region, cotton_arr, noncotton_arr)
+#     else:
+#         print("[9] Auto-searching plots (top %d by \u0394JM) ..." % N_PLOTS_PER_REGION)
+#         cands = generate_candidates(cotton_arr, noncotton_arr)
+#
+#     if not cands:
+#         print("    !! 没有满足样本量阈值的网格，请调小 MIN_* 或调大 PLOT_SIZE_DEG。")
+#         return
+#
+#     # 13) 统一 X 轴范围（跨所选地块，按研究区统一）
+#     #     —— 保证同一研究区内所有地块的 CSP 面板 X 轴一致、所有地块的 ECSPI 面板 X 轴一致。
+#     #     注意：Y 轴不在此处统一，改为每个地块在 plot_one_plot 内自适应。
+#     csp_all, ecspi_all = [], []
+#     for cand in cands:
+#         c = subset_plot(cotton_arr, cand["bbox"]); o = subset_plot(noncotton_arr, cand["bbox"])
+#         csp_all.extend(list(c["CSP"]));   csp_all.extend(list(o["CSP"]))
+#         ecspi_all.extend(list(c["ECSPI"])); ecspi_all.extend(list(o["ECSPI"]))
+#     csp_all = np.array([v for v in csp_all if np.isfinite(v)])
+#     ecspi_all = np.array([v for v in ecspi_all if np.isfinite(v)])
+#     xlim_csp   = (float(np.percentile(csp_all, 1)),   float(np.percentile(csp_all, 99)))
+#     xlim_ecspi = (float(np.percentile(ecspi_all, 1)), float(np.percentile(ecspi_all, 99)))
+#
+#     # 14) 逐地块计算子类别 + 绘图 + 累积 CSV
+#     print("[10] Rendering %d plots (per-plot adaptive y-axis) ..." % len(cands))
+#     for k, cand in enumerate(cands, start=1):
+#         c = subset_plot(cotton_arr, cand["bbox"]); o = subset_plot(noncotton_arr, cand["bbox"])
+#
+#         summary_rows.append({
+#             "region": region, "plot": k,
+#             "bbox_W": cand["bbox"][0], "bbox_S": cand["bbox"][1],
+#             "bbox_E": cand["bbox"][2], "bbox_N": cand["bbox"][3],
+#             "n_cotton": cand["n_cotton"], "n_noncotton": cand["n_noncotton"],
+#             "CSP_M": cand["CSP_M"], "CSP_JM": cand["CSP_JM"],
+#             "ECSPI_M": cand["ECSPI_M"], "ECSPI_JM": cand["ECSPI_JM"],
+#             "dM": cand["dM"], "dJM": cand["dJM"],
+#         })
+#
+#         # 子类别 M/JM（含 ALL）
+#         for code, name in [(-1, "ALL Noncotton")] + [(c2, n2) for c2, n2, _, _ in present_subcats(o)]:
+#             if code == -1:
+#                 ssub_csp = separability(c["CSP"], o["CSP"])
+#                 ssub_ecs = separability(c["ECSPI"], o["ECSPI"])
+#                 npts = int(np.isfinite(o["CSP"]).sum())
+#             else:
+#                 m = (o["cropType"] == code)
+#                 ssub_csp = separability(c["CSP"], o["CSP"][m])
+#                 ssub_ecs = separability(c["ECSPI"], o["ECSPI"][m])
+#                 npts = int(np.isfinite(o["CSP"][m]).sum())
+#             subcat_rows.append({
+#                 "region": region, "plot": k, "subcategory": name, "n_noncotton": npts,
+#                 "CSP_M": ssub_csp[0], "CSP_JM": ssub_csp[1],
+#                 "ECSPI_M": ssub_ecs[0], "ECSPI_JM": ssub_ecs[1],
+#                 "dM": (ssub_ecs[0] - ssub_csp[0]) if np.isfinite(ssub_ecs[0]) and np.isfinite(ssub_csp[0]) else float("nan"),
+#                 "dJM": (ssub_ecs[1] - ssub_csp[1]) if np.isfinite(ssub_ecs[1]) and np.isfinite(ssub_csp[1]) else float("nan"),
+#             })
+#
+#         fname = plot_one_plot(region, k, cand, cotton_arr, noncotton_arr,
+#                               xlim_csp, xlim_ecspi)
+#         print("     - Plot %d: CSP JM=%.3f  ECSPI JM=%.3f  (\u0394JM=%+.3f)  -> %s"
+#               % (k, cand["CSP_JM"], cand["ECSPI_JM"], cand["dJM"], os.path.basename(fname)))
+#
+#     sfile = plot_region_summary(region, cands)
+#     print("     - Summary -> %s" % os.path.basename(sfile))
+#
+#
+# # ============================================================================
+# #  CSV 输出
+# # ============================================================================
+# def write_csv(path, rows, columns):
+#     import csv
+#     with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+#         w = csv.DictWriter(fh, fieldnames=columns)
+#         w.writeheader()
+#         for r in rows:
+#             w.writerow(r)
+#     print("[csv] wrote:", path)
+#
+#
+# # ============================================================================
+# #  main
+# # ============================================================================
+# def main():
+#     init_ee()
+#
+#     summary_rows = []
+#     subcat_rows  = []
+#     did_verify_flag = {"done": False}
+#
+#     for region in REGIONS:
+#         if region not in REGION_BOUNDS:
+#             print("Skip unknown region:", region)
+#             continue
+#         try:
+#             process_region(region, YEAR, summary_rows, subcat_rows, did_verify_flag)
+#         except Exception as e:
+#             import traceback
+#             print("!! REGION %s FAILED: %s" % (region, repr(e)))
+#             traceback.print_exc()
+#
+#     # CSV
+#     if summary_rows:
+#         write_csv(os.path.join(OUTPUT_DIR, "separability_summary.csv"), summary_rows,
+#                   ["region", "plot", "bbox_W", "bbox_S", "bbox_E", "bbox_N",
+#                    "n_cotton", "n_noncotton", "CSP_M", "CSP_JM",
+#                    "ECSPI_M", "ECSPI_JM", "dM", "dJM"])
+#     if subcat_rows:
+#         write_csv(os.path.join(OUTPUT_DIR, "separability_by_subcategory.csv"), subcat_rows,
+#                   ["region", "plot", "subcategory", "n_noncotton",
+#                    "CSP_M", "CSP_JM", "ECSPI_M", "ECSPI_JM", "dM", "dJM"])
+#
+#     # 控制台汇总
+#     print("\n" + "=" * 70)
+#     print("SUMMARY (Cotton vs ALL Non-cotton)")
+#     print("=" * 70)
+#     print("%-9s %-5s %8s %8s %8s %8s %8s %8s" %
+#           ("region", "plot", "CSP_M", "ECSPI_M", "dM", "CSP_JM", "ECSP_JM", "dJM"))
+#     for r in summary_rows:
+#         print("%-9s %-5d %8.3f %8.3f %8.3f %8.3f %8.3f %+8.3f" %
+#               (r["region"], r["plot"], r["CSP_M"], r["ECSPI_M"], r["dM"],
+#                r["CSP_JM"], r["ECSPI_JM"], r["dJM"]))
+#
+#     print("\nAll outputs in:", OUTPUT_DIR)
+#
+#
+# if __name__ == "__main__":
+#     main()
+#
+#
+#     # # ============================================================================
+#     # #  【新增】整个研究区分离度（whole-region，不做小地块拆分）
+#     # #  —— 复用本文件已定义的：init_ee / build_masks / compute_obs_density /
+#     # #     load_csp_index / load_prefuse / compute_fusion_weights / fuse_ecspi /
+#     # #     add_lonlat / sample_to_arrays / separability / gaussian_kde /
+#     # #     present_subcats / compute_plot_ymax / write_csv 等。
+#     # #  用法：把本段追加到原脚本末尾，运行 main_region_wide()。
+#     # # ============================================================================
+#     # def plot_region_wide(region, cand, cotton_arr, noncotton_arr):
+#     #     """整区分布图：竖排 CSP(上) / ECSPI(下)，用全部采样点（不拆地块）。"""
+#     #     c = {"CSP": cotton_arr["CSP"], "ECSPI": cotton_arr["ECSPI"]}
+#     #     o = noncotton_arr
+#     #     subcats = present_subcats(o)
+#     #
+#     #     # X 轴：整区(棉花+非棉花)数据的 1%~99% 分位
+#     #     def xlim_of(key):
+#     #         v = np.concatenate([c[key], o[key]])
+#     #         v = v[np.isfinite(v)]
+#     #         if v.size == 0:
+#     #             return (0.0, 1.0)
+#     #         lo, hi = float(np.percentile(v, 1)), float(np.percentile(v, 99))
+#     #         return (lo, hi) if hi > lo else (lo, lo + 1.0)
+#     #
+#     #     xlim_csp = xlim_of("CSP")
+#     #     xlim_ecspi = xlim_of("ECSPI")
+#     #
+#     #     # Y 上限：整区自适应（上下面板共用）
+#     #     ymax = compute_plot_ymax(c, o, subcats, xlim_csp, xlim_ecspi)
+#     #
+#     #     fig, axes = plt.subplots(2, 1, figsize=(8.0, 9.5))
+#     #     panels = [
+#     #         (axes[0], "CSP", "CSP", xlim_csp, cand["CSP_M"], cand["CSP_JM"]),
+#     #         (axes[1], "ECSPI", "ECSPI", xlim_ecspi, cand["ECSPI_M"], cand["ECSPI_JM"]),
+#     #     ]
+#     #
+#     #     for ax, key, title, xlim, Mval, JMval in panels:
+#     #         xs = np.linspace(xlim[0], xlim[1], 400)
+#     #
+#     #         # 非棉花总体（灰，虚线）
+#     #         d_all = gaussian_kde(o[key], xs)
+#     #         ax.plot(xs, d_all, color=NONCOTTON_COLOR, lw=1.6, ls="--",
+#     #                 label="ALL Noncotton", zorder=2)
+#     #         ax.fill_between(xs, d_all, color=NONCOTTON_COLOR, alpha=0.06, zorder=1)
+#     #
+#     #         # 各子类别（图例只用类别名，不标 JM）
+#     #         for code, name, color, m in subcats:
+#     #             d = gaussian_kde(o[key][m], xs)
+#     #             ax.plot(xs, d, color=color, lw=1.7, label=name, zorder=3)
+#     #             ax.fill_between(xs, d, color=color, alpha=0.08, zorder=1)
+#     #
+#     #         # 棉花（红、加粗、置顶）
+#     #         d_cot = gaussian_kde(c[key], xs)
+#     #         ax.plot(xs, d_cot, color=COTTON_COLOR, lw=3.0, label="Cotton", zorder=5)
+#     #         ax.fill_between(xs, d_cot, color=COTTON_COLOR, alpha=0.12, zorder=4)
+#     #
+#     #         # 棉花均值 μ：红色粗虚线 + 数值（尽量靠上）
+#     #         cot_vals = c[key][np.isfinite(c[key])]
+#     #         if cot_vals.size > 0:
+#     #             cot_mu = float(cot_vals.mean())
+#     #             ax.axvline(cot_mu, color=COTTON_COLOR, lw=2.5, ls="--", zorder=6,
+#     #                        label="Cotton \u03bc")
+#     #             span = (xlim[1] - xlim[0]) if (xlim[1] > xlim[0]) else 1.0
+#     #             frac = (cot_mu - xlim[0]) / span
+#     #             if frac > 0.5:
+#     #                 ha, dx = "right", -0.012 * span
+#     #             else:
+#     #                 ha, dx = "left", 0.012 * span
+#     #             mu_y = ymax * 0.90
+#     #             if frac > 0.72 or frac < 0.20:
+#     #                 mu_y = ymax * 0.52
+#     #             ax.text(cot_mu + dx, mu_y, "\u03bc = %.3f" % cot_mu,
+#     #                     color=COTTON_COLOR, fontsize=10, fontweight="bold",
+#     #                     ha=ha, va="top", zorder=7,
+#     #                     bbox=dict(boxstyle="round,pad=0.25", fc="white",
+#     #                               ec=COTTON_COLOR, alpha=0.9))
+#     #
+#     #         ax.set_xlim(xlim)
+#     #         ax.set_ylim(0, ymax)
+#     #         ax.set_title(title, fontsize=13, fontweight="bold")
+#     #         ax.set_xlabel("Index value")
+#     #         ax.set_ylabel("Density")
+#     #         ax.grid(alpha=0.25, lw=0.6)
+#     #
+#     #         # M / JM 框：固定右上角
+#     #         txt = "Cotton vs Non-cotton\nM  = %.3f\nJM = %.3f" % (Mval, JMval)
+#     #         ax.text(0.97, 0.96, txt, transform=ax.transAxes, ha="right", va="top",
+#     #                 fontsize=9.5,
+#     #                 bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="#999999", alpha=0.92))
+#     #
+#     #         ax.legend(fontsize=8, loc="upper left", framealpha=0.85)
+#     #
+#     #     dJM = cand["ECSPI_JM"] - cand["CSP_JM"]
+#     #     sign = "+" if dJM >= 0 else ""
+#     #     fig.suptitle("%s  -  Whole region   (cotton n=%d, non-cotton n=%d)   \u0394JM = %s%.3f"
+#     #                  % (REGION_TITLE.get(region, region),
+#     #                     cand["n_cotton"], cand["n_noncotton"], sign, dJM),
+#     #                  fontsize=12.5, fontweight="bold")
+#     #     fig.tight_layout(rect=[0, 0, 1, 0.96])
+#     #
+#     #     fname = os.path.join(OUTPUT_DIR, "%s_wholeregion_separability.png" % region)
+#     #     fig.savefig(fname, dpi=160)
+#     #     plt.close(fig)
+#     #     return fname
+#     #
+#     #
+#     # def process_region_wide(region, year, region_rows, subcat_rows):
+#     #     print("\n" + "=" * 70)
+#     #     print("WHOLE-REGION  |  REGION: %s   YEAR: %d" % (region, year))
+#     #     print("=" * 70)
+#     #
+#     #     study_area = ee.Geometry.Rectangle(REGION_BOUNDS[region])
+#     #
+#     #     # 1) 样本点
+#     #     cotton_fc = ee.FeatureCollection(COTTON_ASSET_PATHS[region]).filterBounds(study_area)
+#     #     noncotton_fc = ee.FeatureCollection(NON_COTTON_ASSET_PATHS[region]).filterBounds(study_area)
+#     #
+#     #     # 2) 掩膜
+#     #     print("[1] Building masks ...")
+#     #     _, extendedMask = build_masks(study_area, cotton_fc, noncotton_fc)
+#     #
+#     #     # 3) 观测密度 + 百分位
+#     #     print("[2] Computing S2 observation density & percentiles ...")
+#     #     s2ObsDensity = compute_obs_density(study_area, extendedMask, year)
+#     #     obsStats = s2ObsDensity.updateMask(extendedMask).reduceRegion(
+#     #         reducer=ee.Reducer.percentile([10, 90]), geometry=study_area,
+#     #         scale=ANALYSIS_SCALE, maxPixels=int(1e13), bestEffort=True, tileScale=TILE_SCALE)
+#     #     od = ee_getinfo_retry(obsStats)
+#     #     kp10 = find_key(od, "p10");
+#     #     kp90 = find_key(od, "p90")
+#     #     p10 = max(float(od[kp10]), 1.0) if (kp10 and od[kp10] is not None) else 1.0
+#     #     p90 = max(float(od[kp90]), 3.0) if (kp90 and od[kp90] is not None) else 3.0
+#     #     print("    obs P10=%.2f  P90=%.2f" % (p10, p90))
+#     #
+#     #     # 4) CSP（方法一）+ ECSPI（方法二，融合）
+#     #     print("[3] Loading CSP & fusing ECSPI ...")
+#     #     csp_index = load_csp_index(region, year, study_area, extendedMask)
+#     #     csp_s2_denoised, csp_modis = load_prefuse(region, year, study_area, extendedMask)
+#     #     weights = compute_fusion_weights(csp_s2_denoised, csp_modis, s2ObsDensity,
+#     #                                      extendedMask, p10, p90)
+#     #     ecspi, _ = fuse_ecspi(csp_s2_denoised, csp_modis, weights, extendedMask, study_area)
+#     #
+#     #     # 5) 区域级一次性采样（全部样本点，不拆地块）
+#     #     print("[4] Sampling region-wide (once) ...")
+#     #     stacked = ee.Image.cat([csp_index.rename("CSP"), ecspi.rename("ECSPI")])
+#     #     cotton_arr, _ = sample_to_arrays(stacked, add_lonlat(cotton_fc), with_croptype=False)
+#     #     noncotton_arr, _ = sample_to_arrays(stacked, add_lonlat(noncotton_fc), with_croptype=True)
+#     #     print("    cotton sampled:    CSP=%d  ECSPI=%d" %
+#     #           (np.isfinite(cotton_arr["CSP"]).sum(), np.isfinite(cotton_arr["ECSPI"]).sum()))
+#     #     print("    noncotton sampled: CSP=%d  ECSPI=%d" %
+#     #           (np.isfinite(noncotton_arr["CSP"]).sum(), np.isfinite(noncotton_arr["ECSPI"]).sum()))
+#     #
+#     #     # 6) 整区分离度：Cotton vs ALL Non-cotton
+#     #     M_csp, JM_csp, _, _ = separability(cotton_arr["CSP"], noncotton_arr["CSP"])
+#     #     M_ecs, JM_ecs, _, _ = separability(cotton_arr["ECSPI"], noncotton_arr["ECSPI"])
+#     #     print("    [ALL] CSP   M=%.3f JM=%.3f | ECSPI M=%.3f JM=%.3f | dJM=%+.3f"
+#     #           % (M_csp, JM_csp, M_ecs, JM_ecs, JM_ecs - JM_csp))
+#     #
+#     #     region_rows.append({
+#     #         "region": region,
+#     #         "n_cotton": int(np.isfinite(cotton_arr["CSP"]).sum()),
+#     #         "n_noncotton": int(np.isfinite(noncotton_arr["CSP"]).sum()),
+#     #         "CSP_M": M_csp, "CSP_JM": JM_csp,
+#     #         "ECSPI_M": M_ecs, "ECSPI_JM": JM_ecs,
+#     #         "dM": (M_ecs - M_csp), "dJM": (JM_ecs - JM_csp),
+#     #     })
+#     #
+#     #     # 7) 整区分离度：按子类别（Cotton vs 每种作物 + ALL）
+#     #     for code, name in ([(-1, "ALL Noncotton")] +
+#     #                        [(c2, n2) for c2, n2, _, _ in present_subcats(noncotton_arr)]):
+#     #         if code == -1:
+#     #             s_csp = separability(cotton_arr["CSP"], noncotton_arr["CSP"])
+#     #             s_ecs = separability(cotton_arr["ECSPI"], noncotton_arr["ECSPI"])
+#     #             npts = int(np.isfinite(noncotton_arr["CSP"]).sum())
+#     #         else:
+#     #             m = (noncotton_arr["cropType"] == code)
+#     #             s_csp = separability(cotton_arr["CSP"], noncotton_arr["CSP"][m])
+#     #             s_ecs = separability(cotton_arr["ECSPI"], noncotton_arr["ECSPI"][m])
+#     #             npts = int(np.isfinite(noncotton_arr["CSP"][m]).sum())
+#     #         subcat_rows.append({
+#     #             "region": region, "subcategory": name, "n_noncotton": npts,
+#     #             "CSP_M": s_csp[0], "CSP_JM": s_csp[1],
+#     #             "ECSPI_M": s_ecs[0], "ECSPI_JM": s_ecs[1],
+#     #             "dM": (s_ecs[0] - s_csp[0]) if np.isfinite(s_ecs[0]) and np.isfinite(s_csp[0]) else float("nan"),
+#     #             "dJM": (s_ecs[1] - s_csp[1]) if np.isfinite(s_ecs[1]) and np.isfinite(s_csp[1]) else float("nan"),
+#     #         })
+#     #
+#     #     # 8) 整区分布图
+#     #     cand = {
+#     #         "CSP_M": M_csp, "CSP_JM": JM_csp, "ECSPI_M": M_ecs, "ECSPI_JM": JM_ecs,
+#     #         "n_cotton": int(np.isfinite(cotton_arr["CSP"]).sum()),
+#     #         "n_noncotton": int(np.isfinite(noncotton_arr["CSP"]).sum()),
+#     #     }
+#     #     fname = plot_region_wide(region, cand, cotton_arr, noncotton_arr)
+#     #     print("    plot -> %s" % os.path.basename(fname))
+#     #
+#     #
+#     # def main_region_wide():
+#     #     init_ee()
+#     #
+#     #     region_rows = []
+#     #     subcat_rows = []
+#     #     for region in REGIONS:
+#     #         if region not in REGION_BOUNDS:
+#     #             print("Skip unknown region:", region);
+#     #             continue
+#     #         try:
+#     #             process_region_wide(region, YEAR, region_rows, subcat_rows)
+#     #         except Exception as e:
+#     #             import traceback
+#     #             print("!! REGION %s FAILED: %s" % (region, repr(e)))
+#     #             traceback.print_exc()
+#     #
+#     #     # CSV
+#     #     if region_rows:
+#     #         write_csv(os.path.join(OUTPUT_DIR, "separability_region_wide.csv"), region_rows,
+#     #                   ["region", "n_cotton", "n_noncotton",
+#     #                    "CSP_M", "CSP_JM", "ECSPI_M", "ECSPI_JM", "dM", "dJM"])
+#     #     if subcat_rows:
+#     #         write_csv(os.path.join(OUTPUT_DIR, "separability_region_wide_by_subcategory.csv"),
+#     #                   subcat_rows,
+#     #                   ["region", "subcategory", "n_noncotton",
+#     #                    "CSP_M", "CSP_JM", "ECSPI_M", "ECSPI_JM", "dM", "dJM"])
+#     #
+#     #     # 控制台汇总
+#     #     print("\n" + "=" * 70)
+#     #     print("WHOLE-REGION SUMMARY (Cotton vs ALL Non-cotton)")
+#     #     print("=" * 70)
+#     #     print("%-9s %8s %8s %8s %8s %8s %8s" %
+#     #           ("region", "CSP_M", "ECSPI_M", "dM", "CSP_JM", "ECSP_JM", "dJM"))
+#     #     for r in region_rows:
+#     #         print("%-9s %8.3f %8.3f %8.3f %8.3f %8.3f %+8.3f" %
+#     #               (r["region"], r["CSP_M"], r["ECSPI_M"], r["dM"],
+#     #                r["CSP_JM"], r["ECSPI_JM"], r["dJM"]))
+#     #     print("\nAll outputs in:", OUTPUT_DIR)
+#     #
+#     #
+#     # if __name__ == "__main__":
+#     #     main_region_wide()
+#
+
+
+
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+ECSPI / CSP 分离度（M / JM）计算与绘图   —   方法一 & 方法二 完整实现
+【V2：中间数据 Asset 缓存版】
+================================================================================
+核心改动（相对 V1）：
+  1. 新增 obs_density_asset_id / ecspi_final_asset_id ——
+     计算量最大的两个中间结果缓存到 GEE Asset，第二次运行直接加载，跳过耗时计算。
+
+  2. 缓存层次（从重到轻）：
+       ① S2 观测密度 s2ObsDensity   → Asset  {r}_obs_density_{y}        (scale=100m)
+       ② 最终 ECSPI（融合+残差校正）→ Asset  {r}_ECSPI_final_{y}        (scale=10m)
+       ③ obs p10/p90、融合统计量    → 本地 JSON   stats_cache.json
+
+  3. FORCE_RECOMPUTE = False 时：
+       - 若 ECSPI_final Asset 存在 → 跳过步骤②③④⑤⑥⑦，直接加载两个索引影像采样。
+       - 若仅 obs_density Asset 存在 → 跳过①，仍计算融合权重 + ECSPI。
+       设为 True 则忽略所有缓存，强制从头计算。
+
+  4. 重试策略升级：指数退避（最长 120s），最多 6 次，消除代理抖动 + GEE 超时。
+
+  5. obs percentile 改用 scale=500（原 100），大幅降低百分位统计的服务端压力；
+     指数本身的统计量（融合 S2/MODIS mean+std）仍用 scale=100，保持与原流程一致。
+
+原代码所有计算逻辑、参数、波段命名均 **完整保留，未做任何简化**。
+================================================================================
+"""
+
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+ECSPI / CSP 分离度（M / JM）计算与绘图   —   V3：整区版 + 全局统一 X 轴
+================================================================================
+V3 相对 V2 的改动：
+  1. OUTPUT_DIR → D:\\WYY\\ECSPI\\期刊
+  2. RUN_MODE 新增 "region_wide"（默认）：每个研究区画一张整区分布图，不拆小地块。
+  3. 全局统一 X 轴：先采样所有三个研究区，再统一计算三区合并后的
+     CSP 1%~99% 分位 / ECSPI 1%~99% 分位，三张单区图和一张联合图均使用同一 xlim。
+  4. 新增三张图：
+       ① 每研究区单独图（2 面板竖排：上 CSP / 下 ECSPI，含子类别曲线）
+       ② 2×3 联合对比图（2 行×3 列，棉花 vs 非棉花，全局统一 X/Y 轴）
+       ③ 三区 M/JM 柱状汇总图（CSP vs ECSPI 分组对比）
+  5. 保留 V2 全套 Asset 缓存逻辑（obs_density / ECSPI_final / JSON 统计量缓存），
+     第二次运行直接加载 Asset，跳过耗时计算。
+  6. 小地块分析代码原样保留（RUN_MODE="small_plots" 可启用）。
+
+Y 轴策略：
+  • 单区图：同一张图的两个面板（CSP / ECSPI）使用相同 ymax，便于纵向对比。
+  • 联合图：同一行（CSP 行 / ECSPI 行）的三个面板使用相同 ymax（三区最大值），
+    便于横向对比。
+================================================================================
+"""
+
+import os, sys, math, json, time
+
+# ============================================================================
+#  CONFIG
+# ============================================================================
+
+# ---- 代理 -------------------------------------------------------------------
+CLASH_PORT = 7890
+PROXY_URL  = "http://127.0.0.1:%d" % CLASH_PORT
+for _k in ("HTTP_PROXY","HTTPS_PROXY","http_proxy","https_proxy","ALL_PROXY","grpc_proxy"):
+    os.environ[_k] = PROXY_URL
+print("[proxy] Using Clash proxy:", PROXY_URL)
+
+# ---- 运行模式 ----------------------------------------------------------------
+# "region_wide"  → 仅整区图（默认，本版新功能）
+# "small_plots"  → 仅小地块图（V2 原始功能）
+# "both"         → 两者都跑
+RUN_MODE = "region_wide"
+
+# ---- 输出目录 ----------------------------------------------------------------
+OUTPUT_DIR = r"D:\WYY\ECSPI\期刊"
+try:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+except Exception:
+    _fb = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ecspi_outputs")
+    os.makedirs(_fb, exist_ok=True)
+    print("[warning] 无法创建 %s，改用 %s" % (OUTPUT_DIR, _fb))
+    OUTPUT_DIR = _fb
+
+# 本地统计量 JSON 缓存（跟随输出目录）
+STATS_CACHE_FILE = os.path.join(OUTPUT_DIR, "stats_cache.json")
+
+# ---- GEE 工程与年份 ----------------------------------------------------------
+EE_PROJECT = "wangyiyao"
+YEAR       = 2019
+
+# ---- 研究区边界 --------------------------------------------------------------
+REGIONS = ["aksu", "kashi", "changji"]
+REGION_BOUNDS = {
+    "aksu":    [78.0, 40.0, 85.0, 42.5],
+    "kashi":   [75.5, 37.5, 80.0, 41.0],
+    "changji": [83.0, 43.5, 89.0, 46.0],
+}
+
+# ---- 样本点 asset ------------------------------------------------------------
+COTTON_ASSET_PATHS = {
+    "aksu":    "projects/wangyiyao/assets/aksu_cotton_4000",
+    "changji": "projects/wangyiyao/assets/changji_cotton_4000",
+    "kashi":   "projects/wangyiyao/assets/kashi_cotton_3000",
+}
+NON_COTTON_ASSET_PATHS = {
+    "aksu":    "projects/wangyiyao/assets/aksu_noncotton_4000",
+    "changji": "projects/wangyiyao/assets/changji_noncotton_4000",
+    "kashi":   "projects/wangyiyao/assets/kashi_noncotton_3000",
+}
+
+# ---- 原代码常量 --------------------------------------------------------------
+OUTPUT_SCALE     = 10
+ANALYSIS_SCALE   = 100
+TILE_SCALE       = 16
+COMPOSITE_PERIOD = 10
+
+# ---- 缓存控制 ----------------------------------------------------------------
+FORCE_RECOMPUTE  = False   # True = 忽略缓存，强制重算
+OBS_EXPORT_SCALE = 100     # obs density Asset 导出尺度
+OBS_STATS_SCALE  = 500     # obs p10/p90 计算尺度（降低服务端压力）
+EXPORT_TIMEOUT_H = 3
+
+# ---- SD 校验 -----------------------------------------------------------------
+VERIFY_SD    = True
+
+# 密度图 y 轴固定上限（整数刻度 0,1,2,…,DENSITY_YMAX）
+# 设为 None 则每张图自动适应
+DENSITY_YMAX = 8
+
+# ---- 小地块参数（RUN_MODE="small_plots" 时有效）----------------------------
+PLOT_SIZE_DEG       = 0.25
+MIN_COTTON_PTS      = 20
+MIN_NONCOTTON_PTS   = 20
+MIN_VALS_PER_CLASS  = 15
+N_PLOTS_PER_REGION  = 5
+PREFER_POSITIVE_GAP = True
+MANUAL_PLOTS        = {}
+
+# ---- 配色 -------------------------------------------------------------------
+SUBCAT_DEFS = [
+    (2, "Corn",      "#FB8C00"),
+    (3, "Wheat",     "#FDD835"),
+    (4, "Orchard",   "#43A047"),
+    (5, "OtherCrop", "#1E88E5"),
+    (6, "NonCrop",   "#8E24AA"),
+]
+COTTON_COLOR    = "#E53935"
+NONCOTTON_COLOR = "#455A64"
+REGION_TITLE    = {"aksu": "Aksu", "kashi": "Kashgar", "changji": "TC"}
+
+
+# ============================================================================
+#  Asset ID 函数
+# ============================================================================
+def m1_asset_id(region, year):
+    return "projects/{p}/assets/{r}_CSP_s2only_{y}_Noise".format(
+        p=EE_PROJECT, r=region, y=year)
+
+def m2_asset_id(region, year):
+    return "projects/{p}/assets/{r}_CSP_fused_{y}".format(
+        p=EE_PROJECT, r=region, y=year)
+
+def obs_density_asset_id(region, year):
+    return "projects/{p}/assets/{r}_obsdensity_{y}".format(
+        p=EE_PROJECT, r=region, y=year)
+
+def ecspi_final_asset_id(region, year):
+    return "projects/{p}/assets/{r}_ECSPI_final_{y}".format(
+        p=EE_PROJECT, r=region, y=year)
+
+
+# ============================================================================
+#  导入 EE + numpy + matplotlib
+# ============================================================================
+try:
+    import ee
+except ImportError:
+    sys.exit("ERROR: earthengine-api 未安装。请先运行: pip install earthengine-api")
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+
+
+# ============================================================================
+#  EE 初始化 + 重试
+# ============================================================================
+def init_ee():
+    import socket
+    socket.setdefaulttimeout(300)
+    try:
+        ee.Initialize(project=EE_PROJECT)
+        print("[ee] Initialized:", EE_PROJECT)
+    except Exception as e:
+        print("[ee] Initialize failed, trying Authenticate() ...", repr(e))
+        ee.Authenticate()
+        ee.Initialize(project=EE_PROJECT)
+        print("[ee] Initialized after authentication.")
+
+
+def ee_getinfo_retry(obj, retries=6, base_delay=8.0):
+    """指数退避重试，最多 6 次（8→16→32→64→120→120s）。"""
+    last = None
+    for i in range(retries):
+        try:
+            return obj.getInfo()
+        except Exception as e:
+            last = e
+            wait = min(base_delay * (2 ** i), 120.0)
+            print("  [retry %d/%d] %.0fs — %s" % (i+1, retries, wait, repr(e)))
+            time.sleep(wait)
+    raise last
+
+
+# ============================================================================
+#  EE 计算辅助
+# ============================================================================
+def maskS2Clouds(image):
+    qa  = image.select("QA60")
+    qaMask = (qa.bitwiseAnd(1<<10).eq(0).And(qa.bitwiseAnd(1<<11).eq(0)))
+    scl = image.select("SCL")
+    sclMask = (scl.neq(3).And(scl.neq(8)).And(scl.neq(9))
+                         .And(scl.neq(10)).And(scl.neq(11)))
+    return (image.updateMask(qaMask.And(sclMask))
+                 .divide(10000)
+                 .copyProperties(image, ["system:time_start"]))
+
+
+def calculateSI(image):
+    si   = image.select("B6").add(image.select("B7")).add(image.select("B8")).float().rename("SI")
+    date = ee.Date(image.get("system:time_start"))
+    return (image.addBands(si)
+                 .set("DOY", date.getRelative("day","year"))
+                 .set("date", date.format("YYYY-MM-dd")))
+
+
+def find_key(d, *substrs):
+    for k in d.keys():
+        if all(s in k for s in substrs):
+            return k
+    return None
+
+
+# ============================================================================
+#  Asset 缓存辅助
+# ============================================================================
+def asset_exists(asset_id):
+    try:
+        ee.data.getAsset(asset_id)
+        return True
+    except Exception:
+        return False
+
+
+def export_and_wait(image, asset_id, study_area, description,
+                    scale, timeout_hours=EXPORT_TIMEOUT_H):
+    """导出 GEE Image 到 Asset，同步等待完成。"""
+    if asset_exists(asset_id):
+        try:
+            ee.data.deleteAsset(asset_id)
+            print("      [export] 删除旧 Asset:", asset_id)
+        except Exception as ex:
+            print("      [export] 删除失败（继续）:", repr(ex))
+
+    task = ee.batch.Export.image.toAsset(
+        image=image, description=description[:100],
+        assetId=asset_id, region=study_area,
+        scale=scale, maxPixels=int(1e13),
+        pyramidingPolicy={".default": "mean"})
+    task.start()
+
+    deadline = time.time() + timeout_hours * 3600
+    print("      [export] 任务已提交，轮询中... AssetId:", asset_id)
+    while time.time() < deadline:
+        time.sleep(30)
+        try:
+            state = task.status()["state"]
+            print("      [%s] %s" % (time.strftime("%H:%M:%S"), state))
+            if state == "COMPLETED":
+                print("      [export] 完成:", asset_id); return
+            if state in ("FAILED","CANCELLED"):
+                raise RuntimeError("Export %s — %s: %s" %
+                    (state, description, task.status().get("error_message","?")))
+        except RuntimeError:
+            raise
+        except Exception as ex:
+            print("      [export] 状态查询失败（忽略）:", repr(ex))
+    raise TimeoutError("Export 超时 (%dh): %s" % (timeout_hours, description))
+
+
+# ============================================================================
+#  本地 JSON 统计量缓存
+# ============================================================================
+_JSON_CACHE = None
+
+def json_cache_get(key):
+    global _JSON_CACHE
+    if _JSON_CACHE is None:
+        try:
+            with open(STATS_CACHE_FILE, "r", encoding="utf-8") as f:
+                _JSON_CACHE = json.load(f)
+        except Exception:
+            _JSON_CACHE = {}
+    return _JSON_CACHE.get(key)
+
+def json_cache_set(key, value):
+    global _JSON_CACHE
+    if _JSON_CACHE is None:
+        json_cache_get(key)
+    _JSON_CACHE[key] = value
+    try:
+        with open(STATS_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_JSON_CACHE, f, indent=2, ensure_ascii=False)
+    except Exception as ex:
+        print("  [json_cache] 写入失败:", repr(ex))
+
+
+# ============================================================================
+#  掩膜构建（原代码行 78-115）
+# ============================================================================
+def build_masks(study_area, cotton_fc, noncotton_fc):
+    worldCover = ee.ImageCollection("ESA/WorldCover/v100").first().select("Map")
+    croplandMask  = worldCover.clip(study_area).eq(40)
+    elevationMask = ee.Image("USGS/SRTMGL1_003").select("elevation").lt(1300).clip(study_area)
+    comprehensiveMask = (croplandMask.And(elevationMask)
+                         .rename("mask").clip(study_area)
+                         .reproject(crs="EPSG:4326", scale=OUTPUT_SCALE))
+
+    allSamples = cotton_fc.merge(noncotton_fc).filterBounds(study_area)
+    sampleRaster = (ee.Image.constant(1).byte()
+                    .clip(ee.FeatureCollection(allSamples.map(lambda f: f.buffer(150))))
+                    .unmask(0).clip(study_area))
+    extendedMask = (comprehensiveMask.Or(sampleRaster)
+                    .rename("mask").clip(study_area)
+                    .reproject(crs="EPSG:4326", scale=OUTPUT_SCALE))
+    return comprehensiveMask, extendedMask
+
+
+# ============================================================================
+#  S2 观测密度（原代码行 1516-1581）+ Asset 缓存
+# ============================================================================
+def compute_obs_density(study_area, extended_mask, year):
+    start = "%d-04-01" % year; end = "%d-10-31" % year
+    startEE = ee.Date(start); endEE = ee.Date(end)
+    numPeriods = endEE.difference(startEE,"day").divide(COMPOSITE_PERIOD).ceil()
+    periodSeq  = ee.List.sequence(0, numPeriods.subtract(1))
+
+    s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+          .filterBounds(study_area).filterDate(start, end)
+          .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE",70)))
+    s2si = s2.map(maskS2Clouds).map(calculateSI)
+
+    def per_period(i):
+        i = ee.Number(i)
+        ps = startEE.advance(i.multiply(COMPOSITE_PERIOD),"day")
+        pe = ps.advance(COMPOSITE_PERIOD,"day")
+        imgs = s2si.filterDate(ps,pe).select("SI")
+        return ee.Image(ee.Algorithms.If(
+            imgs.size().gt(0),
+            imgs.count().float().rename("obs_count"),
+            ee.Image.constant(0).float().rename("obs_count")))
+
+    return (ee.ImageCollection.fromImages(periodSeq.map(per_period))
+            .sum().rename("total_obs_count")
+            .updateMask(extended_mask).clip(study_area))
+
+
+def get_or_compute_obs_density(region, year, study_area, extended_mask):
+    aid = obs_density_asset_id(region, year)
+    if not FORCE_RECOMPUTE and asset_exists(aid):
+        print("    [cache] obs_density Asset:", aid)
+        return ee.Image(aid).rename("total_obs_count").updateMask(extended_mask).clip(study_area)
+    print("    [compute] obs_density（首次计算，较慢）...")
+    img = compute_obs_density(study_area, extended_mask, year)
+    print("    [export] obs_density → Asset ...")
+    export_and_wait(img, aid, study_area, "%s_obs_density_%d"%(region,year), OBS_EXPORT_SCALE)
+    return ee.Image(aid).rename("total_obs_count").updateMask(extended_mask).clip(study_area)
+
+
+def get_or_compute_obs_percentiles(region, year, s2ObsDensity, study_area, extended_mask):
+    key = "%s_%d_obs_pct" % (region, year)
+    if not FORCE_RECOMPUTE:
+        cached = json_cache_get(key)
+        if cached:
+            p10, p90 = float(cached["p10"]), float(cached["p90"])
+            print("    [cache] obs P10=%.2f P90=%.2f (JSON)" % (p10, p90))
+            return p10, p90
+    print("    [compute] obs P10/P90 (scale=%dm)..." % OBS_STATS_SCALE)
+    od   = ee_getinfo_retry(s2ObsDensity.updateMask(extended_mask).reduceRegion(
+        reducer=ee.Reducer.percentile([10,90]), geometry=study_area,
+        scale=OBS_STATS_SCALE, maxPixels=int(1e13), bestEffort=True, tileScale=TILE_SCALE))
+    p10  = max(float(od[find_key(od,"p10")]), 1.0) if find_key(od,"p10") else 1.0
+    p90  = max(float(od[find_key(od,"p90")]), 3.0) if find_key(od,"p90") else 3.0
+    print("    obs P10=%.2f P90=%.2f" % (p10, p90))
+    json_cache_set(key, {"p10": p10, "p90": p90})
+    return p10, p90
+
+
+# ============================================================================
+#  指数 Asset 载入
+# ============================================================================
+def load_csp_index(region, year, study_area, extended_mask):
+    return ee.Image(m1_asset_id(region,year)).rename("CSP_s2only").clip(study_area).updateMask(extended_mask)
+
+def load_prefuse(region, year, study_area, extended_mask):
+    img = ee.Image(m2_asset_id(region,year)).clip(study_area).updateMask(extended_mask)
+    return img.select("CSP_s2only"), img.select("CSP_MODIS")
+
+
+# ============================================================================
+#  自适应融合权重（原代码行 866-942）
+# ============================================================================
+def compute_fusion_weights(csp_s2, csp_modis, s2ObsDensity, mask, obsP10, obsP90):
+    ms2  = csp_s2.updateMask(mask)
+    mmod = csp_modis.updateMask(mask)
+    mobs = s2ObsDensity.updateMask(mask)
+    p10  = ee.Number(obsP10).max(1); p90 = ee.Number(obsP90).max(3)
+
+    obsNorm = ms2.subtract(p10).divide(p90.subtract(p10).max(1)).clamp(0,1) # wrong variable, fix:
+    obsNorm = mobs.subtract(p10).divide(p90.subtract(p10).max(1)).clamp(0,1)
+    gapScore = ee.Image.constant(1).divide(
+        ee.Image.constant(1).add(obsNorm.subtract(0.4).multiply(-8).exp())).rename("gap_score")
+
+    kernel = ee.Kernel.square(3,"pixels")
+    s2mean = ms2.reduceNeighborhood(ee.Reducer.mean(),   kernel, skipMasked=True)
+    s2std  = ms2.reduceNeighborhood(ee.Reducer.stdDev(), kernel, skipMasked=True)
+    s2conf = ee.Image.constant(1).divide(
+        ee.Image.constant(1).add(ms2.subtract(s2mean).abs().divide(s2std.max(0.001)))).rename("s2_confidence")
+
+    mmean = mmod.reduceNeighborhood(ee.Reducer.mean(), kernel, skipMasked=True)
+    agree = ms2.subtract(s2mean).multiply(mmod.subtract(mmean)).gt(0).float()
+    consis = agree.reduceNeighborhood(ee.Reducer.mean(), kernel, skipMasked=True).rename("consistency")
+
+    w_s2 = (gapScore.multiply(0.70).add(s2conf.multiply(0.15)).add(consis.multiply(0.15))
+            .clamp(0.3, 0.95).rename("w_s2"))
+    w_s2 = w_s2.where(mobs.lt(p10), w_s2.min(0.5))
+    return w_s2.updateMask(mask)
+
+
+# ============================================================================
+#  融合 + 残差校正（原代码行 4104-4239）+ Asset 缓存
+# ============================================================================
+def fuse_ecspi(csp_s2, csp_modis, fusion_weights, mask, study_area):
+    def _stats(img):
+        d = ee_getinfo_retry(img.reduceRegion(
+            reducer=ee.Reducer.mean().combine(ee.Reducer.stdDev(), sharedInputs=True),
+            geometry=study_area, scale=ANALYSIS_SCALE,
+            maxPixels=int(1e13), bestEffort=True, tileScale=8))
+        mu  = float(d[find_key(d,"mean")])
+        std = max(float(d[find_key(d,"stdDev")]), 0.0001)
+        return mu, std
+
+    s2mu, s2std  = _stats(csp_s2)
+    mmu, mstd    = _stats(csp_modis.updateMask(mask))
+
+    aligned  = csp_modis.subtract(mmu).divide(mstd).multiply(s2std).add(s2mu)
+    wmod     = ee.Image.constant(1).subtract(fusion_weights)
+    wmod_d   = wmod.pow(2)
+    ws2_d    = ee.Image.constant(1).subtract(wmod_d)
+    fused    = (csp_s2.multiply(ws2_d).add(aligned.multiply(wmod_d))
+                .rename("CSP_fused").updateMask(mask).clip(study_area))
+
+    resDict  = ee_getinfo_retry(fused.subtract(csp_s2).rename("CSP_fused").reduceRegion(
+        reducer=ee.Reducer.mean(), geometry=study_area, scale=ANALYSIS_SCALE,
+        maxPixels=int(1e13), bestEffort=True, tileScale=8))
+    k_res    = find_key(resDict,"CSP_fused") or (list(resDict.keys())[0] if resDict else None)
+    resBias  = float(resDict[k_res]) if (k_res and resDict.get(k_res) is not None) else 0.0
+
+    fusedCorr = fused.subtract(ee.Number(resBias*0.5)).rename("ECSPI").updateMask(mask).clip(study_area)
+    stats = dict(cspS2Mean=s2mu, cspS2Std=s2std, cspModisMean=mmu, cspModisStd=mstd,
+                 resBias=resBias, bias_correction=resBias*0.5)
+    print("    [fuse] S2 mean=%.4f std=%.4f | MODIS mean=%.4f std=%.4f | resBias=%.4f"
+          % (s2mu, s2std, mmu, mstd, resBias))
+    return fusedCorr, stats
+
+
+def get_or_fuse_ecspi(region, year, csp_s2, csp_modis, fusion_weights, mask, study_area):
+    aid = ecspi_final_asset_id(region, year)
+    if not FORCE_RECOMPUTE and asset_exists(aid):
+        print("    [cache] ECSPI_final Asset:", aid)
+        return ee.Image(aid).select("ECSPI").clip(study_area).updateMask(mask)
+
+    key = "%s_%d_fusion" % (region, year)
+    cached = json_cache_get(key) if not FORCE_RECOMPUTE else None
+    if cached:
+        print("    [cache] 融合统计量来自 JSON，跳过 2 次 reduceRegion")
+        s2mu=float(cached["cspS2Mean"]); s2std=max(float(cached["cspS2Std"]),0.0001)
+        mmu=float(cached["cspModisMean"]); mstd=max(float(cached["cspModisStd"]),0.0001)
+        resBias=float(cached["resBias"])
+        aligned  = csp_modis.subtract(mmu).divide(mstd).multiply(s2std).add(s2mu)
+        wmod_d   = ee.Image.constant(1).subtract(fusion_weights).pow(2)
+        ws2_d    = ee.Image.constant(1).subtract(wmod_d)
+        fused    = (csp_s2.multiply(ws2_d).add(aligned.multiply(wmod_d))
+                    .rename("CSP_fused").updateMask(mask).clip(study_area))
+        fusedCorr = fused.subtract(ee.Number(resBias*0.5)).rename("ECSPI").updateMask(mask).clip(study_area)
+    else:
+        print("    [compute] ECSPI 自适应融合（含 getInfo×3）...")
+        fusedCorr, stats = fuse_ecspi(csp_s2, csp_modis, fusion_weights, mask, study_area)
+        json_cache_set(key, stats)
+
+    print("    [export] ECSPI_final → Asset (scale=%dm)..." % OUTPUT_SCALE)
+    export_and_wait(fusedCorr, aid, study_area, "%s_ECSPI_final_%d"%(region,year), OUTPUT_SCALE)
+    return ee.Image(aid).select("ECSPI").clip(study_area).updateMask(mask)
+
+
+# ============================================================================
+#  采样
+# ============================================================================
+def add_lonlat(fc):
+    def f(feat):
+        c = feat.geometry().centroid(maxError=1).coordinates()
+        return feat.set("plon", ee.Number(c.get(0))).set("plat", ee.Number(c.get(1)))
+    return fc.map(f)
+
+
+def sample_to_arrays(stacked_img, fc, with_croptype):
+    props   = ["plon","plat"] + (["cropType"] if with_croptype else [])
+    sampled = stacked_img.sampleRegions(
+        collection=fc, properties=props, scale=OUTPUT_SCALE, tileScale=TILE_SCALE)
+    agg = {"CSP":  sampled.aggregate_array("CSP"),
+           "ECSPI":sampled.aggregate_array("ECSPI"),
+           "plon": sampled.aggregate_array("plon"),
+           "plat": sampled.aggregate_array("plat")}
+    if with_croptype:
+        agg["cropType"] = sampled.aggregate_array("cropType")
+    data = ee_getinfo_retry(ee.Dictionary(agg))
+    out  = {"CSP":  np.array(data.get("CSP",[]),  dtype=float),
+            "ECSPI":np.array(data.get("ECSPI",[]),dtype=float),
+            "lon":  np.array(data.get("plon",[]), dtype=float),
+            "lat":  np.array(data.get("plat",[]), dtype=float)}
+    if with_croptype:
+        ct = data.get("cropType",[])
+        out["cropType"] = np.array([(-1 if v is None else v) for v in ct], dtype=float)
+    return out, sampled
+
+
+# ============================================================================
+#  分离度 M / JM（原代码行 1064-1105）
+# ============================================================================
+def separability(a, b):
+    a=np.asarray(a,float); b=np.asarray(b,float)
+    a=a[np.isfinite(a)];   b=b[np.isfinite(b)]
+    if len(a)<2 or len(b)<2: return float("nan"),float("nan"),len(a),len(b)
+    mu1,mu2 = float(a.mean()),float(b.mean())
+    d1=max(float(a.std(ddof=0)),0.0001); d2=max(float(b.std(ddof=0)),0.0001)
+    M  = abs(mu1-mu2)/(d1+d2)
+    v1,v2 = d1*d1, d2*d2
+    B  = 0.125*2.0*(mu1-mu2)**2/(v1+v2) + 0.5*math.log((v1+v2)/(2.0*d1*d2))
+    JM = 2.0*(1.0-math.exp(-B))
+    return M,JM,len(a),len(b)
+
+
+# ============================================================================
+#  高斯核密度（自包含）
+# ============================================================================
+def gaussian_kde(samples, xs):
+    s=np.asarray(samples,float); s=s[np.isfinite(s)]; n=s.size
+    if n==0: return np.zeros_like(xs)
+    if n==1: bw=max((xs.max()-xs.min())/50.,1e-3)
+    else:
+        std=s.std(ddof=1)
+        if std<=0: std=max((xs.max()-xs.min())/50.,1e-3)
+        bw=max(std*n**(-0.2),(xs.max()-xs.min())/200.,1e-3)
+    diff=(xs[None,:]-s[:,None])/bw
+    return np.exp(-0.5*diff**2).sum(0)/(n*bw*math.sqrt(2*math.pi))
+
+
+# ============================================================================
+#  子类别辅助
+# ============================================================================
+def present_subcats(noncotton_arr):
+    res=[]
+    if "cropType" not in noncotton_arr: return res
+    ct=noncotton_arr["cropType"]
+    for code,name,color in SUBCAT_DEFS:
+        m=(ct==code)
+        if int(np.isfinite(noncotton_arr["CSP"][m]).sum())>=3:
+            res.append((code,name,color,m))
+    return res
+
+
+# ============================================================================
+#  ★ 通用面板绘制（CSP 或 ECSPI 的单个 KDE 面板）
+#    show_subcats=True 则绘制子类别曲线（单区图用）
+#    show_subcats=False 则只绘棉花 vs 全非棉花（联合图用）
+# ============================================================================
+
+# ============================================================================
+#  ★ 通用面板绘制
+#
+#  V5 改动：
+#    • 移除 show_noncotton_mu（用户取消需求）
+#    • 新增 dM=None：ECSPI 面板右侧同时显示 ΔM + ΔJM
+#    • legend_right_below=False：True 时图例贴 M/JM 框下方右侧（用于联合图 (a)）
+# ============================================================================
+def _draw_panel(ax, cotton_arr, noncotton_arr, key, xlim, ymax,
+                M_val, JM_val,
+                dJM=None, dM=None,
+                show_subcats=True,
+                show_legend=True,
+                legend_right_below=False,
+                show_xlabel=True,
+                show_ylabel=True,
+                panel_label=None):
+
+    xs   = np.linspace(xlim[0], xlim[1], 400)
+    span = max(xlim[1] - xlim[0], 1e-6)
+
+    # 有效 y 上限：全局固定值优先，否则用传入的 adaptive ymax
+    eff_ymax = float(DENSITY_YMAX) if (DENSITY_YMAX is not None) else float(ymax)
+
+    # ── ALL Noncotton（灰虚线）──────────────────────────────────────────────
+    d_nc = gaussian_kde(noncotton_arr[key], xs)
+    ax.plot(xs, d_nc, color=NONCOTTON_COLOR, lw=1.8, ls="--",
+            label="ALL Noncotton", zorder=2)
+    ax.fill_between(xs, d_nc, color=NONCOTTON_COLOR, alpha=0.07, zorder=1)
+
+    # ── 子类别曲线 ──────────────────────────────────────────────────────────
+    if show_subcats:
+        for code, name, color, m in present_subcats(noncotton_arr):
+            d = gaussian_kde(noncotton_arr[key][m], xs)
+            ax.plot(xs, d, color=color, lw=1.8, label=name, zorder=3)
+            ax.fill_between(xs, d, color=color, alpha=0.09, zorder=1)
+
+    # ── Cotton（红粗线）────────────────────────────────────────────────────
+    d_ct = gaussian_kde(cotton_arr[key], xs)
+    ax.plot(xs, d_ct, color=COTTON_COLOR, lw=3.0, label="Cotton", zorder=5)
+    ax.fill_between(xs, d_ct, color=COTTON_COLOR, alpha=0.13, zorder=4)
+
+    # ── 棉花均值 μ 竖线 + 标注 ─────────────────────────────────────────────
+    cot_vals = cotton_arr[key][np.isfinite(cotton_arr[key])]
+    if cot_vals.size > 0:
+        mu_c = float(cot_vals.mean())
+        ax.axvline(mu_c, color=COTTON_COLOR, lw=2.2, ls="--", zorder=6)
+        frac = (mu_c - xlim[0]) / span
+        ha_c, dx_c = ("right", -0.013*span) if frac > 0.5 else ("left", 0.013*span)
+        cy = eff_ymax * (0.50 if (frac > 0.72 or frac < 0.20) else 0.88)
+        ax.text(mu_c + dx_c, cy, "\u03bc\u1D04=%.3f" % mu_c,
+                color=COTTON_COLOR, fontsize=8.5, fontweight="bold",
+                ha=ha_c, va="top", zorder=7,
+                bbox=dict(boxstyle="round,pad=0.18", fc="white",
+                          ec=COTTON_COLOR, alpha=0.90, lw=0.8))
+
+    # ── 坐标轴 ─────────────────────────────────────────────────────────────
+    ax.set_xlim(xlim)
+    ax.set_ylim(0, eff_ymax)
+    # y 轴整数刻度（0, 1, 2, … , DENSITY_YMAX）
+    if DENSITY_YMAX is not None:
+        ax.set_yticks(range(int(DENSITY_YMAX) + 1))
+    ax.grid(alpha=0.22, lw=0.55)
+    ax.tick_params(labelsize=8.5)
+
+    # ── 右上角 M / JM / ΔM / ΔJM 注释 ─────────────────────────────────────
+    txt = "M  = %.3f\nJM = %.3f" % (M_val, JM_val)
+    if dM is not None:
+        txt += "\n\u0394M  = %+.3f" % dM
+    if dJM is not None:
+        txt += "\n\u0394JM = %+.3f" % dJM
+    anno = ax.text(0.975, 0.975, txt, transform=ax.transAxes,
+                   ha="right", va="top", fontsize=8.5,
+                   bbox=dict(boxstyle="round,pad=0.30", fc="white",
+                             ec="#aaaaaa", alpha=0.93, lw=0.8))
+
+    # ── 面板字母标签（左上角）──────────────────────────────────────────────
+    if panel_label is not None:
+        ax.text(0.015, 0.975, panel_label, transform=ax.transAxes,
+                ha="left", va="top", fontsize=11, fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.20", fc="white",
+                          ec="none", alpha=0.85))
+
+    # ── 图例 ───────────────────────────────────────────────────────────────
+    if show_legend:
+        n_anno_lines = txt.count("\n") + 1        # 注释框行数
+        # 估算注释框在 axes 坐标系的底部 y（每行约 0.055）
+        anno_box_h   = n_anno_lines * 0.058 + 0.04
+        legend_top_y = 0.975 - anno_box_h - 0.02  # 留 0.02 间隙
+
+        if legend_right_below:
+            ax.legend(fontsize=7.5,
+                      loc="upper right",
+                      bbox_to_anchor=(0.975, legend_top_y),
+                      framealpha=0.88,
+                      handlelength=1.3,
+                      handletextpad=0.45,
+                      borderpad=0.45,
+                      labelspacing=0.30)
+        else:
+            ax.legend(fontsize=7.5, loc="upper left",
+                      framealpha=0.85,
+                      handlelength=1.3,
+                      handletextpad=0.45,
+                      borderpad=0.45,
+                      labelspacing=0.30)
+
+    if show_xlabel:
+        ax.set_xlabel("Index value", fontsize=10)
+    if show_ylabel:
+        ax.set_ylabel("Density", fontsize=10)
+
+
+# ============================================================================
+#  ★ 单区整体图（2 面板竖排：上 CSP / 下 ECSPI）
+#    ymax：主曲线峰为基准，子类别最多上推 1.8× 主峰
+#    xlim：由调用方传入（全局统一）
+# ============================================================================
+def plot_region_wide_single(region, data, xlim_csp, xlim_ecspi):
+    cotton_arr    = data["cotton_arr"]
+    noncotton_arr = data["noncotton_arr"]
+    M_csp, JM_csp = data["M_csp"], data["JM_csp"]
+    M_ecs, JM_ecs = data["M_ecs"], data["JM_ecs"]
+    dJM = JM_ecs - JM_csp
+    dM  = M_ecs  - M_csp
+    nc  = data["n_cotton"]; no = data["n_noncotton"]
+    subcats = present_subcats(noncotton_arr)
+
+    def _ym(key, xlim):
+        xs = np.linspace(xlim[0], xlim[1], 400)
+        main_pk = max(gaussian_kde(cotton_arr[key], xs).max(),
+                      gaussian_kde(noncotton_arr[key], xs).max())
+        sub_pk  = max((gaussian_kde(noncotton_arr[key][m], xs).max()
+                       for _, _, _, m in subcats
+                       if np.isfinite(noncotton_arr[key][m]).sum() >= 3),
+                      default=0.0)
+        eff = max(main_pk, min(sub_pk, main_pk * 1.80))
+        return (eff * 1.15) if (np.isfinite(eff) and eff > 0) else 1.0
+
+    ymax = max(_ym("CSP", xlim_csp), _ym("ECSPI", xlim_ecspi))
+
+    fig, axes = plt.subplots(2, 1, figsize=(8.8, 10.0))
+
+    _draw_panel(axes[0], cotton_arr, noncotton_arr,
+                "CSP", xlim_csp, ymax, M_csp, JM_csp,
+                show_subcats=True, show_legend=True,
+                show_xlabel=False, show_ylabel=True, panel_label="(a)")
+    axes[0].set_title("CSP", fontsize=13, fontweight="bold")
+
+    _draw_panel(axes[1], cotton_arr, noncotton_arr,
+                "ECSPI", xlim_ecspi, ymax, M_ecs, JM_ecs,
+                dJM=dJM, dM=dM,
+                show_subcats=True, show_legend=False,
+                show_xlabel=True, show_ylabel=True, panel_label="(b)")
+    axes[1].set_title("ECSPI", fontsize=13, fontweight="bold")
+
+    sign = "+" if dJM >= 0 else ""
+    fig.suptitle(
+        "%s — Whole Region   (cotton n=%d, non-cotton n=%d)   \u0394JM=%s%.3f"
+        % (REGION_TITLE.get(region, region), nc, no, sign, dJM),
+        fontsize=12.5, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+    fname = os.path.join(OUTPUT_DIR, "%s_wholeregion.png" % region)
+    fig.savefig(fname, dpi=1500, bbox_inches="tight")
+    plt.close(fig)
+    return fname
+
+
+# ============================================================================
+#  ★ 三区联合对比图（2 行 × 3 列）— V5 重点改版
+#
+#  X/Y 轴策略（满足"同一地区保持一致"）：
+#    • 每列（研究区）独立计算 xlim 和 ymax，CSP 行和 ECSPI 行共用同一列的值。
+#    • xlim：该区 CSP + ECSPI 所有值（棉花+非棉花）合并后的 1%~99% 分位区间，
+#            保证同列两行的横轴起止数字完全一致，且曲线装得下、无多余空白。
+#    • ymax：同列所有曲线（CSP 行 + ECSPI 行）主峰的最大值，子类别按 1.8× 主峰封顶，
+#            × 1.12 headroom；同列两行共用，纵向可直接对比峰高。
+#  其他改动：
+#    • 所有地物曲线（show_subcats=True）
+#    • 右侧注释同时显示 M、ΔM、JM、ΔJM（ECSPI 行）
+#    • 图例位于面板 (a) 右上角注释框正下方
+#    • 图形更扁：高度进一步压缩
+# ============================================================================
+def _region_xlim_and_ymax(d, cap=1.80):
+    """
+    为单个研究区计算联合图所用的 xlim（CSP+ECSPI 合并）和 ymax（两行共用）。
+    cap：子类别峰值相对主峰的上限倍数，超过则截断（防止细窄子类别拉高 y 轴）。
+    """
+    all_vals = []
+    for key in ("CSP", "ECSPI"):
+        v = np.concatenate([d["cotton_arr"][key], d["noncotton_arr"][key]])
+        all_vals.extend(v[np.isfinite(v)].tolist())
+    all_vals = np.array(all_vals)
+    xlim = (float(np.percentile(all_vals, 1)), float(np.percentile(all_vals, 99)))
+
+    ym = 0.0
+    for key in ("CSP", "ECSPI"):
+        xs = np.linspace(xlim[0], xlim[1], 400)
+        main_pk = max(gaussian_kde(d["cotton_arr"][key],    xs).max(),
+                      gaussian_kde(d["noncotton_arr"][key], xs).max())
+        sub_pks = [gaussian_kde(d["noncotton_arr"][key][m], xs).max()
+                   for _, _, _, m in present_subcats(d["noncotton_arr"])
+                   if np.isfinite(d["noncotton_arr"][key][m]).sum() >= 3]
+        effective = max([main_pk] + [min(p, main_pk * cap) for p in sub_pks])
+        ym = max(ym, effective)
+    ymax = (ym * 1.12) if (np.isfinite(ym) and ym > 0) else 1.0
+    return xlim, ymax
+
+
+def plot_all_regions_combined(region_data, regions_order, xlim_csp, xlim_ecspi):
+    # xlim_csp / xlim_ecspi 仍作参数保持接口兼容，联合图内部改用per-region值
+    n = len(regions_order)
+
+    # ── 预计算每列的 xlim 和 ymax（两行共用）──────────────────────────────
+    col_xlim  = {}
+    col_ymax  = {}
+    for region in regions_order:
+        col_xlim[region], col_ymax[region] = _region_xlim_and_ymax(region_data[region])
+
+    # ── 建图：更扁，紧凑间距 ───────────────────────────────────────────────
+    fig, axes = plt.subplots(
+        2, n,
+        figsize=(6.5 * n, 6.8),
+        gridspec_kw={"hspace": 0.22, "wspace": 0.20},
+    )
+
+    # 字母标签 (a)-(f)，行优先
+    labels = [chr(ord("a") + row * n + col)
+              for row in range(2) for col in range(n)]
+    label_idx = 0
+
+    row_configs = [
+        (0, "CSP",   "M_csp", "JM_csp"),
+        (1, "ECSPI", "M_ecs", "JM_ecs"),
+    ]
+
+    for row, key, mk, jmk in row_configs:
+        for col, region in enumerate(regions_order):
+            d    = region_data[region]
+            ax   = axes[row][col]
+            xlim = col_xlim[region]
+            ymax = col_ymax[region]
+            Mv   = d[mk]; JMv = d[jmk]
+
+            # ECSPI 行：同时显示 ΔM 和 ΔJM
+            dJM_val = (d["JM_ecs"] - d["JM_csp"]) if row == 1 else None
+            dM_val  = (d["M_ecs"]  - d["M_csp"])  if row == 1 else None
+
+            plabel    = "(%s)" % labels[label_idx]; label_idx += 1
+            is_panel_a = (row == 0 and col == 0)
+
+            _draw_panel(ax, d["cotton_arr"], d["noncotton_arr"],
+                        key, xlim, ymax, Mv, JMv,
+                        dJM=dJM_val, dM=dM_val,
+                        show_subcats=True,
+                        show_legend=is_panel_a,
+                        legend_right_below=is_panel_a,   # 图例在 (a) 右上角框下方
+                        show_xlabel=(row == 1),
+                        show_ylabel=(col == 0),
+                        panel_label=plabel)
+
+            # 列标题（顶行上方）
+            if row == 0:
+                ax.set_title(REGION_TITLE.get(region, region),
+                             fontsize=13, fontweight="bold", pad=4)
+
+            # 行标签（最左列 y 轴加前缀）
+            if col == 0:
+                prev = ax.get_ylabel() if ax.get_ylabel() else "Density"
+                ax.set_ylabel(key + "\n" + prev, fontsize=10.5)
+
+    fig.suptitle(
+        "CSP vs ECSPI Separability — Three Regions Comparison\n"
+        "Per-region unified axes: xlim = CSP∪ECSPI 1st–99th pct, "
+        "ymax shared between rows within each region",
+        fontsize=11.5, fontweight="bold", y=1.00)
+
+    fname = os.path.join(OUTPUT_DIR, "all_regions_combined.png")
+    fig.savefig(fname, dpi=1500, bbox_inches="tight")
+    plt.close(fig)
+    return fname
+
+
+# ============================================================================
+#  ★ 三区 M/JM 汇总柱状图
+# ============================================================================
+def plot_region_wide_summary_bar(region_data, regions_order):
+    n      = len(regions_order)
+    idx    = np.arange(n)
+    w      = 0.36
+    labels = [REGION_TITLE.get(r, r) for r in regions_order]
+
+    csp_M  = [region_data[r]["M_csp"]  for r in regions_order]
+    ecs_M  = [region_data[r]["M_ecs"]  for r in regions_order]
+    csp_JM = [region_data[r]["JM_csp"] for r in regions_order]
+    ecs_JM = [region_data[r]["JM_ecs"] for r in regions_order]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.8))
+    for ax, csp_v, ecs_v, title, ylim_top in [
+        (axes[0], csp_M,  ecs_M,  "M-index",     None),
+        (axes[1], csp_JM, ecs_JM, "JM-distance", 2.05),
+    ]:
+        bars_csp = ax.bar(idx - w/2, csp_v, w, label="CSP",
+                          color="#90A4AE", edgecolor="#546E7A", linewidth=0.8)
+        bars_ecs = ax.bar(idx + w/2, ecs_v, w, label="ECSPI",
+                          color="#E53935", edgecolor="#B71C1C", linewidth=0.8)
+        for bar in list(bars_csp) + list(bars_ecs):
+            h = bar.get_height()
+            if np.isfinite(h):
+                ax.text(bar.get_x() + bar.get_width()/2, h + 0.008,
+                        "%.3f" % h, ha="center", va="bottom", fontsize=8.5)
+        for i, (cv, ev) in enumerate(zip(csp_v, ecs_v)):
+            if np.isfinite(cv) and np.isfinite(ev):
+                delta = ev - cv
+                sign  = "+" if delta >= 0 else ""
+                ax.text(idx[i], max(cv, ev) + 0.06,
+                        "%s%.3f" % (sign, delta),
+                        ha="center", va="bottom", fontsize=8,
+                        color="#1565C0", fontweight="bold")
+        ax.set_xticks(idx); ax.set_xticklabels(labels, fontsize=11)
+        ax.set_title(title, fontsize=13, fontweight="bold")
+        ax.set_xlabel("Region"); ax.grid(axis="y", alpha=0.25, lw=0.6)
+        ax.legend(fontsize=9)
+        if ylim_top:
+            ax.set_ylim(0, ylim_top)
+
+    fig.suptitle("Whole-Region Separability Summary — CSP vs ECSPI\n"
+                 "(Blue \u0394 = ECSPI \u2212 CSP)",
+                 fontsize=12.5, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    fname = os.path.join(OUTPUT_DIR, "all_regions_MJM_summary.png")
+    fig.savefig(fname, dpi=1500, bbox_inches="tight")
+    plt.close(fig)
+    return fname
+
+
+# ============================================================================
+#  整区采样（复用 V2 全套 Asset 缓存逻辑）
+# ============================================================================
+def process_region_wide_sample(region, year):
+    """加载/计算索引影像，采样全部样本点。ECSPI_final Asset 存在则直接加载。"""
+    study_area   = ee.Geometry.Rectangle(REGION_BOUNDS[region])
+    cotton_fc    = ee.FeatureCollection(COTTON_ASSET_PATHS[region]).filterBounds(study_area)
+    noncotton_fc = ee.FeatureCollection(NON_COTTON_ASSET_PATHS[region]).filterBounds(study_area)
+
+    print("[1] Building masks ...")
+    _, extendedMask = build_masks(study_area, cotton_fc, noncotton_fc)
+
+    ecspi_aid = ecspi_final_asset_id(region, year)
+    if not FORCE_RECOMPUTE and asset_exists(ecspi_aid):
+        print("[快捷] ECSPI_final Asset 存在，直接加载两个索引影像。")
+        csp_index = load_csp_index(region, year, study_area, extendedMask)
+        ecspi     = ee.Image(ecspi_aid).select("ECSPI").clip(study_area).updateMask(extendedMask)
+    else:
+        print("[2] get_or_compute_obs_density ...")
+        s2ObsDensity = get_or_compute_obs_density(region, year, study_area, extendedMask)
+        print("[3] get_or_compute_obs_percentiles ...")
+        p10, p90 = get_or_compute_obs_percentiles(region, year, s2ObsDensity, study_area, extendedMask)
+        print("[4] Loading CSP (method 1) ...")
+        csp_index = load_csp_index(region, year, study_area, extendedMask)
+        print("[5] Loading pre-fusion 2-band ...")
+        csp_s2d, csp_modis = load_prefuse(region, year, study_area, extendedMask)
+        print("[6] Fusion weights ...")
+        weights = compute_fusion_weights(csp_s2d, csp_modis, s2ObsDensity, extendedMask, p10, p90)
+        print("[7] get_or_fuse_ecspi ...")
+        ecspi = get_or_fuse_ecspi(region, year, csp_s2d, csp_modis, weights, extendedMask, study_area)
+
+    stacked = ee.Image.cat([csp_index.rename("CSP"), ecspi.rename("ECSPI")])
+    print("[8] Sampling ...")
+    cotton_arr,    csampled = sample_to_arrays(stacked, add_lonlat(cotton_fc),    False)
+    noncotton_arr, _        = sample_to_arrays(stacked, add_lonlat(noncotton_fc), True)
+    print("    cotton:    CSP=%d  ECSPI=%d" %
+          (np.isfinite(cotton_arr["CSP"]).sum(), np.isfinite(cotton_arr["ECSPI"]).sum()))
+    print("    noncotton: CSP=%d  ECSPI=%d" %
+          (np.isfinite(noncotton_arr["CSP"]).sum(), np.isfinite(noncotton_arr["ECSPI"]).sum()))
+    return cotton_arr, noncotton_arr
+
+
+# ============================================================================
+#  ★ 整区主流程（两阶段：先采样 → 计算全局 xlim → 绘图）
+# ============================================================================
+def run_region_wide():
+    """
+    Phase 1：遍历所有研究区，采样。
+    Phase 2：三区合并，计算全局统一 X 轴范围（供单区图使用）。
+    Phase 3：绘图。
+      联合图：per-region xlim+ymax（自适应，同列两行一致）。
+      单区图：全局统一 xlim（三区可横向对比绝对值）。
+    """
+    region_data = {}
+    region_rows = []
+    subcat_rows = []
+    did_verify  = {"done": False}
+
+    # ── Phase 1 ──────────────────────────────────────────────────────────────
+    for region in REGIONS:
+        if region not in REGION_BOUNDS:
+            print("Skip:", region); continue
+        try:
+            print("\n" + "=" * 70)
+            print("WHOLE-REGION  |  REGION: %s   YEAR: %d" % (region, YEAR))
+            print("=" * 70)
+            cotton_arr, noncotton_arr = process_region_wide_sample(region, YEAR)
+
+            if VERIFY_SD and not did_verify["done"]:
+                v = cotton_arr["CSP"]; v = v[np.isfinite(v)]
+                print("    [VERIFY_SD] numpy ddof=0 SD=%.6f  (n=%d)" %
+                      (float(v.std(ddof=0)), len(v)))
+                did_verify["done"] = True
+
+            M_csp, JM_csp, _, _ = separability(cotton_arr["CSP"],   noncotton_arr["CSP"])
+            M_ecs, JM_ecs, _, _ = separability(cotton_arr["ECSPI"], noncotton_arr["ECSPI"])
+            nc = int(np.isfinite(cotton_arr["CSP"]).sum())
+            no = int(np.isfinite(noncotton_arr["CSP"]).sum())
+            print("  CSP:   M=%.4f  JM=%.4f" % (M_csp, JM_csp))
+            print("  ECSPI: M=%.4f  JM=%.4f  \u0394JM=%+.4f" %
+                  (M_ecs, JM_ecs, JM_ecs - JM_csp))
+
+            region_data[region] = {
+                "cotton_arr":    cotton_arr,
+                "noncotton_arr": noncotton_arr,
+                "M_csp": M_csp, "JM_csp": JM_csp,
+                "M_ecs": M_ecs, "JM_ecs": JM_ecs,
+                "n_cotton": nc, "n_noncotton": no,
+            }
+            region_rows.append({
+                "region": region, "n_cotton": nc, "n_noncotton": no,
+                "CSP_M": M_csp, "CSP_JM": JM_csp,
+                "ECSPI_M": M_ecs, "ECSPI_JM": JM_ecs,
+                "dM": M_ecs - M_csp, "dJM": JM_ecs - JM_csp,
+            })
+            for code, name in (
+                [(-1, "ALL Noncotton")] +
+                [(c2, n2) for c2, n2, _, _ in present_subcats(noncotton_arr)]
+            ):
+                if code == -1:
+                    s_c = separability(cotton_arr["CSP"],   noncotton_arr["CSP"])
+                    s_e = separability(cotton_arr["ECSPI"], noncotton_arr["ECSPI"])
+                    npts = no
+                else:
+                    mm   = (noncotton_arr["cropType"] == code)
+                    s_c  = separability(cotton_arr["CSP"],   noncotton_arr["CSP"][mm])
+                    s_e  = separability(cotton_arr["ECSPI"], noncotton_arr["ECSPI"][mm])
+                    npts = int(np.isfinite(noncotton_arr["CSP"][mm]).sum())
+                subcat_rows.append({
+                    "region": region, "subcategory": name, "n_noncotton": npts,
+                    "CSP_M":  s_c[0], "CSP_JM":  s_c[1],
+                    "ECSPI_M": s_e[0], "ECSPI_JM": s_e[1],
+                    "dM":  (s_e[0]-s_c[0]) if (np.isfinite(s_e[0]) and np.isfinite(s_c[0])) else float("nan"),
+                    "dJM": (s_e[1]-s_c[1]) if (np.isfinite(s_e[1]) and np.isfinite(s_c[1])) else float("nan"),
+                })
+        except Exception as e:
+            import traceback
+            print("!! REGION %s FAILED: %s" % (region, repr(e)))
+            traceback.print_exc()
+
+    if not region_data:
+        print("!! 无有效区域数据，退出。"); return
+
+    # ── Phase 2：全局 X 轴（供单区图使用）───────────────────────────────────
+    all_csp, all_ecspi = [], []
+    for d in region_data.values():
+        for key, lst in [("CSP", all_csp), ("ECSPI", all_ecspi)]:
+            v = np.concatenate([d["cotton_arr"][key], d["noncotton_arr"][key]])
+            lst.extend(v[np.isfinite(v)].tolist())
+    all_csp   = np.array(all_csp);   all_ecspi = np.array(all_ecspi)
+    global_xlim_csp   = (float(np.percentile(all_csp,   1)), float(np.percentile(all_csp,   99)))
+    global_xlim_ecspi = (float(np.percentile(all_ecspi, 1)), float(np.percentile(all_ecspi, 99)))
+
+    print("\n" + "=" * 70)
+    print("全局统一 X 轴（单区图用，三区合并 1%%~99%% 分位）")
+    print("  CSP:   [%.4f,  %.4f]" % global_xlim_csp)
+    print("  ECSPI: [%.4f,  %.4f]" % global_xlim_ecspi)
+    print("  联合图改用 per-region 自适应 xlim（同列 CSP+ECSPI 共用）")
+    print("=" * 70)
+
+    # ── Phase 3：绘图 ────────────────────────────────────────────────────────
+    regions_ordered = [r for r in REGIONS if r in region_data]
+
+    print("\n[绘图] 单区整体图（全局 xlim，含子类别）...")
+    for region in regions_ordered:
+        fname = plot_region_wide_single(
+            region, region_data[region], global_xlim_csp, global_xlim_ecspi)
+        print("  -> %s" % os.path.basename(fname))
+
+    print("[绘图] 三区联合对比图（per-region xlim/ymax，全地物，(a)-(f)）...")
+    fname = plot_all_regions_combined(
+        region_data, regions_ordered, global_xlim_csp, global_xlim_ecspi)
+    print("  -> %s" % os.path.basename(fname))
+
+    print("[绘图] 三区 M/JM 汇总柱状图...")
+    fname = plot_region_wide_summary_bar(region_data, regions_ordered)
+    print("  -> %s" % os.path.basename(fname))
+
+    # ── CSV ──────────────────────────────────────────────────────────────────
+    if region_rows:
+        write_csv(os.path.join(OUTPUT_DIR, "separability_region_wide.csv"), region_rows,
+                  ["region", "n_cotton", "n_noncotton",
+                   "CSP_M", "CSP_JM", "ECSPI_M", "ECSPI_JM", "dM", "dJM"])
+    if subcat_rows:
+        write_csv(os.path.join(OUTPUT_DIR, "separability_region_wide_subcategory.csv"),
+                  subcat_rows,
+                  ["region", "subcategory", "n_noncotton",
+                   "CSP_M", "CSP_JM", "ECSPI_M", "ECSPI_JM", "dM", "dJM"])
+
+    # ── 控制台汇总 ────────────────────────────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("WHOLE-REGION SUMMARY  (Cotton vs ALL Non-cotton)")
+    print("=" * 70)
+    print("%-9s %8s %8s %8s %8s %8s %8s" %
+          ("region", "CSP_M", "ECSPI_M", "dM", "CSP_JM", "ECSPI_JM", "dJM"))
+    for r in region_rows:
+        print("%-9s %8.3f %8.3f %8.3f %8.3f %8.3f %+8.3f" %
+              (r["region"], r["CSP_M"], r["ECSPI_M"], r["dM"],
+               r["CSP_JM"], r["ECSPI_JM"], r["dJM"]))
+    print("\nAll outputs in:", OUTPUT_DIR)
+
+
+#  小地块辅助（保留，RUN_MODE="small_plots" 时调用）
+# ============================================================================
+def in_bbox(lon, lat, bbox):
+    w,s,e,n = bbox
+    return (lon>=w)&(lon<e)&(lat>=s)&(lat<n)
+
+def subset_plot(arr, bbox):
+    m   = in_bbox(arr["lon"], arr["lat"], bbox)
+    out = {"CSP":arr["CSP"][m],"ECSPI":arr["ECSPI"][m],
+           "lon":arr["lon"][m],"lat":arr["lat"][m]}
+    if "cropType" in arr: out["cropType"] = arr["cropType"][m]
+    return out
+
+def generate_candidates(cotton_arr, noncotton_arr):
+    size = PLOT_SIZE_DEG
+    def cell_key(lon,lat): return int(math.floor(lon/size)),int(math.floor(lat/size))
+    cells = {}
+    for lon,lat in zip(cotton_arr["lon"],cotton_arr["lat"]):
+        if np.isfinite(lon) and np.isfinite(lat): cells.setdefault(cell_key(lon,lat),True)
+    for lon,lat in zip(noncotton_arr["lon"],noncotton_arr["lat"]):
+        if np.isfinite(lon) and np.isfinite(lat): cells.setdefault(cell_key(lon,lat),True)
+    candidates = []
+    for (ix,iy) in cells.keys():
+        bbox = [ix*size,iy*size,(ix+1)*size,(iy+1)*size]
+        c=subset_plot(cotton_arr,bbox); o=subset_plot(noncotton_arr,bbox)
+        nc=int(np.isfinite(c["CSP"]).sum()); no=int(np.isfinite(o["CSP"]).sum())
+        if len(c["lon"])<MIN_COTTON_PTS or len(o["lon"])<MIN_NONCOTTON_PTS: continue
+        if nc<MIN_VALS_PER_CLASS or no<MIN_VALS_PER_CLASS: continue
+        M_csp,JM_csp,_,_ = separability(c["CSP"],o["CSP"])
+        M_ecs,JM_ecs,_,_ = separability(c["ECSPI"],o["ECSPI"])
+        if not (np.isfinite(JM_csp) and np.isfinite(JM_ecs)): continue
+        candidates.append({"bbox":bbox,"n_cotton":len(c["lon"]),"n_noncotton":len(o["lon"]),
+                            "CSP_M":M_csp,"CSP_JM":JM_csp,"ECSPI_M":M_ecs,"ECSPI_JM":JM_ecs,
+                            "dM":M_ecs-M_csp,"dJM":JM_ecs-JM_csp})
+    def sort_key(d):
+        return (1 if d["dJM"]>0 else 0, d["dJM"], d["dM"]) if PREFER_POSITIVE_GAP else (d["dJM"],d["dM"])
+    candidates.sort(key=sort_key, reverse=True)
+    return candidates[:N_PLOTS_PER_REGION]
+
+
+def plot_one_plot(region, k, cand, cotton_arr, noncotton_arr, xlim_csp, xlim_ecspi):
+    bbox=cand["bbox"]; c=subset_plot(cotton_arr,bbox); o=subset_plot(noncotton_arr,bbox)
+    subcats = present_subcats(o)
+
+    ymax = 0.0
+    for key, xlim in [("CSP",xlim_csp),("ECSPI",xlim_ecspi)]:
+        xs=np.linspace(xlim[0],xlim[1],400)
+        ymax=max(ymax,gaussian_kde(c[key],xs).max(),gaussian_kde(o[key],xs).max())
+        for _,_,_,m in subcats:
+            if np.isfinite(o[key][m]).sum()>=3:
+                ymax=max(ymax,gaussian_kde(o[key][m],xs).max())
+    ymax=(ymax*1.12) if (np.isfinite(ymax) and ymax>0) else 1.0
+
+    fig,axes=plt.subplots(2,1,figsize=(8.5,10.0))
+    for ax,key,title,xlim,Mv,JMv,dJM in [
+        (axes[0],"CSP","CSP",xlim_csp,cand["CSP_M"],cand["CSP_JM"],None),
+        (axes[1],"ECSPI","ECSPI",xlim_ecspi,cand["ECSPI_M"],cand["ECSPI_JM"],
+         cand["ECSPI_JM"]-cand["CSP_JM"])
+    ]:
+        _draw_panel(ax,c,o,key,xlim,ymax,Mv,JMv,dJM=dJM,
+                    show_subcats=True,show_legend=True,
+                    show_xlabel=(key=="ECSPI"),show_ylabel=True)
+        ax.set_title(title,fontsize=13,fontweight="bold")
+
+    dJM=cand["ECSPI_JM"]-cand["CSP_JM"]; sign="+" if dJM>=0 else ""
+    fig.suptitle("%s  Plot %d   (cotton n=%d, non-cotton n=%d)   \u0394JM=%s%.3f"
+                 %(REGION_TITLE.get(region,region),k,cand["n_cotton"],cand["n_noncotton"],sign,dJM),
+                 fontsize=12,fontweight="bold")
+    fig.tight_layout(rect=[0,0,1,0.96])
+    fname=os.path.join(OUTPUT_DIR,"%s_plot%d_separability.png"%(region,k))
+    fig.savefig(fname,dpi=1500,bbox_inches="tight"); plt.close(fig)
+    return fname
+
+
+def plot_region_summary(region, cands):
+    n=len(cands); idx=np.arange(n); w=0.38
+    fig,axes=plt.subplots(1,2,figsize=(12.5,4.4))
+    for ax,metric,title in [(axes[0],"M","M-index"),(axes[1],"JM","JM-distance")]:
+        ax.bar(idx-w/2,[c["CSP_%s"%metric]   for c in cands],w,label="CSP",
+               color="#90A4AE",edgecolor="#546E7A")
+        ax.bar(idx+w/2,[c["ECSPI_%s"%metric] for c in cands],w,label="ECSPI",
+               color="#E53935",edgecolor="#B71C1C")
+        ax.set_xticks(idx); ax.set_xticklabels(["P%d"%(i+1) for i in range(n)])
+        ax.set_title(title,fontsize=13,fontweight="bold"); ax.set_xlabel("Plot")
+        ax.grid(axis="y",alpha=0.25,lw=0.6); ax.legend(fontsize=9)
+        if metric=="JM": ax.set_ylim(0,2.05)
+    fig.suptitle("%s  Separability summary (CSP vs ECSPI)"%REGION_TITLE.get(region,region),
+                 fontsize=12.5,fontweight="bold")
+    fig.tight_layout(rect=[0,0,1,0.94])
+    fname=os.path.join(OUTPUT_DIR,"%s_summary_MJM.png"%region)
+    fig.savefig(fname,dpi=1500,bbox_inches="tight"); plt.close(fig)
+    return fname
+
+
+def process_region_small(region, year, summary_rows, subcat_rows, did_verify_flag):
+    """小地块流程（完整保留 V2 逻辑）。"""
+    print("\n"+"="*70)
+    print("REGION: %s   YEAR: %d" % (region, year))
+    print("="*70)
+    study_area   = ee.Geometry.Rectangle(REGION_BOUNDS[region])
+    cotton_fc    = ee.FeatureCollection(COTTON_ASSET_PATHS[region]).filterBounds(study_area)
+    noncotton_fc = ee.FeatureCollection(NON_COTTON_ASSET_PATHS[region]).filterBounds(study_area)
+
+    print("[1] Building masks ...")
+    _,extendedMask = build_masks(study_area,cotton_fc,noncotton_fc)
+
+    ecspi_aid = ecspi_final_asset_id(region,year)
+    if not FORCE_RECOMPUTE and asset_exists(ecspi_aid):
+        print("[快捷] 直接加载两个索引影像。")
+        csp_index = load_csp_index(region,year,study_area,extendedMask)
+        ecspi     = ee.Image(ecspi_aid).select("ECSPI").clip(study_area).updateMask(extendedMask)
+    else:
+        print("[2] obs_density ..."); s2ObsDensity = get_or_compute_obs_density(region,year,study_area,extendedMask)
+        print("[3] obs percentiles ..."); p10,p90 = get_or_compute_obs_percentiles(region,year,s2ObsDensity,study_area,extendedMask)
+        print("[4] Loading CSP ..."); csp_index = load_csp_index(region,year,study_area,extendedMask)
+        print("[5] Loading pre-fusion ..."); csp_s2d,csp_modis = load_prefuse(region,year,study_area,extendedMask)
+        print("[6] Fusion weights ..."); weights = compute_fusion_weights(csp_s2d,csp_modis,s2ObsDensity,extendedMask,p10,p90)
+        print("[7] ECSPI fuse ..."); ecspi = get_or_fuse_ecspi(region,year,csp_s2d,csp_modis,weights,extendedMask,study_area)
+
+    stacked = ee.Image.cat([csp_index.rename("CSP"), ecspi.rename("ECSPI")])
+    print("[8] Sampling ...")
+    cotton_arr,csampled = sample_to_arrays(stacked,add_lonlat(cotton_fc),False)
+    noncotton_arr,_     = sample_to_arrays(stacked,add_lonlat(noncotton_fc),True)
+
+    if VERIFY_SD and not did_verify_flag["done"]:
+        try:
+            gee_sd = ee_getinfo_retry(ee.Number(csampled.aggregate_total_sd("CSP")))
+            v=cotton_arr["CSP"]; v=v[np.isfinite(v)]
+            print("    [VERIFY_SD] GEE=%.6f numpy=%.6f diff=%.2e"%(gee_sd,float(v.std(ddof=0)),abs(gee_sd-float(v.std(ddof=0)))))
+        except Exception as ex:
+            print("    [VERIFY_SD] skipped:",repr(ex))
+        did_verify_flag["done"] = True
+
+    if MANUAL_PLOTS.get(region):
+        cands = [{"bbox":bbox,"n_cotton":len(subset_plot(cotton_arr,bbox)["lon"]),
+                  "n_noncotton":len(subset_plot(noncotton_arr,bbox)["lon"]),
+                  **dict(zip(["CSP_M","CSP_JM"],separability(subset_plot(cotton_arr,bbox)["CSP"],subset_plot(noncotton_arr,bbox)["CSP"])[:2])),
+                  **dict(zip(["ECSPI_M","ECSPI_JM"],separability(subset_plot(cotton_arr,bbox)["ECSPI"],subset_plot(noncotton_arr,bbox)["ECSPI"])[:2])),
+                  "dM":0,"dJM":0} for bbox in MANUAL_PLOTS[region]]
+    else:
+        cands = generate_candidates(cotton_arr,noncotton_arr)
+
+    if not cands:
+        print("    !! 无满足条件的网格。"); return
+
+    csp_v,ecspi_v=[],[]
+    for cand in cands:
+        c=subset_plot(cotton_arr,cand["bbox"]); o=subset_plot(noncotton_arr,cand["bbox"])
+        csp_v.extend(list(c["CSP"])+list(o["CSP"]))
+        ecspi_v.extend(list(c["ECSPI"])+list(o["ECSPI"]))
+    csp_a=np.array([v for v in csp_v if np.isfinite(v)])
+    ecspi_a=np.array([v for v in ecspi_v if np.isfinite(v)])
+    xlim_csp  =(float(np.percentile(csp_a,1)),  float(np.percentile(csp_a,99)))
+    xlim_ecspi=(float(np.percentile(ecspi_a,1)),float(np.percentile(ecspi_a,99)))
+
+    print("[9] Rendering %d plots ..."%len(cands))
+    for k,cand in enumerate(cands,1):
+        c=subset_plot(cotton_arr,cand["bbox"]); o=subset_plot(noncotton_arr,cand["bbox"])
+        summary_rows.append({"region":region,"plot":k,
+            "bbox_W":cand["bbox"][0],"bbox_S":cand["bbox"][1],"bbox_E":cand["bbox"][2],"bbox_N":cand["bbox"][3],
+            "n_cotton":cand["n_cotton"],"n_noncotton":cand["n_noncotton"],
+            "CSP_M":cand["CSP_M"],"CSP_JM":cand["CSP_JM"],"ECSPI_M":cand["ECSPI_M"],"ECSPI_JM":cand["ECSPI_JM"],
+            "dM":cand["dM"],"dJM":cand["dJM"]})
+        for code,name in ([(-1,"ALL Noncotton")]+[(c2,n2) for c2,n2,_,_ in present_subcats(o)]):
+            if code==-1:
+                sc=separability(c["CSP"],o["CSP"]); se=separability(c["ECSPI"],o["ECSPI"]); npts=int(np.isfinite(o["CSP"]).sum())
+            else:
+                mm=(o["cropType"]==code); sc=separability(c["CSP"],o["CSP"][mm]); se=separability(c["ECSPI"],o["ECSPI"][mm]); npts=int(np.isfinite(o["CSP"][mm]).sum())
+            subcat_rows.append({"region":region,"plot":k,"subcategory":name,"n_noncotton":npts,
+                "CSP_M":sc[0],"CSP_JM":sc[1],"ECSPI_M":se[0],"ECSPI_JM":se[1],
+                "dM":(se[0]-sc[0]) if (np.isfinite(se[0]) and np.isfinite(sc[0])) else float("nan"),
+                "dJM":(se[1]-sc[1]) if (np.isfinite(se[1]) and np.isfinite(sc[1])) else float("nan")})
+        fname=plot_one_plot(region,k,cand,cotton_arr,noncotton_arr,xlim_csp,xlim_ecspi)
+        print("     Plot %d: CSP JM=%.3f  ECSPI JM=%.3f  (\u0394JM=%+.3f) -> %s"
+              %(k,cand["CSP_JM"],cand["ECSPI_JM"],cand["dJM"],os.path.basename(fname)))
+    plot_region_summary(region,cands)
+
+
+def run_small_plots():
+    summary_rows=[]; subcat_rows=[]; did_verify={"done":False}
+    for region in REGIONS:
+        if region not in REGION_BOUNDS: continue
+        try: process_region_small(region,YEAR,summary_rows,subcat_rows,did_verify)
+        except Exception as e:
+            import traceback; print("!! REGION %s FAILED:"%region,repr(e)); traceback.print_exc()
+    if summary_rows:
+        write_csv(os.path.join(OUTPUT_DIR,"separability_summary.csv"),summary_rows,
+                  ["region","plot","bbox_W","bbox_S","bbox_E","bbox_N","n_cotton","n_noncotton",
+                   "CSP_M","CSP_JM","ECSPI_M","ECSPI_JM","dM","dJM"])
+    if subcat_rows:
+        write_csv(os.path.join(OUTPUT_DIR,"separability_by_subcategory.csv"),subcat_rows,
+                  ["region","plot","subcategory","n_noncotton","CSP_M","CSP_JM","ECSPI_M","ECSPI_JM","dM","dJM"])
+
+
+# ============================================================================
+#  CSV 输出
+# ============================================================================
+def write_csv(path, rows, columns):
+    import csv
+    with open(path,"w",newline="",encoding="utf-8-sig") as fh:
+        w=csv.DictWriter(fh,fieldnames=columns); w.writeheader()
+        for r in rows: w.writerow(r)
+    print("[csv] wrote:", path)
+
+
+# ============================================================================
+#  main
+# ============================================================================
+def main():
+    init_ee()
+    if RUN_MODE in ("region_wide", "both"):
+        run_region_wide()
+    if RUN_MODE in ("small_plots", "both"):
+        run_small_plots()
+    if RUN_MODE not in ("region_wide","small_plots","both"):
+        print("未知 RUN_MODE:", RUN_MODE,
+              "  可选值: region_wide / small_plots / both")
+
+if __name__ == "__main__":
+    main()
