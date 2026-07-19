@@ -32,7 +32,7 @@ Usage Guide
 7. Export classification results or intermediate CSP/feature layers to Assets
 
 Algorithm Advantage
-The proposed ECSPI (M2) significantly improves separability between cotton and other crops. It realizes cotton identification at squaring stage, 60–70 days earlier than traditional boll-opening period mapping. Unsupervised classification OA reaches 83.03~92.32%, random forest accuracy up to 96.00~97.77% across 2019–2024 multi-year validation.
+The proposed ECSPI (M2) significantly improves separability between cotton and other crops. It realizes cotton identification at squaring stage, 60–70 days earlier than traditional boll-opening period mapping. Unsupervised classification OA reaches 83.03~92.32%,and random forest accuracy up to 96.00~97.77% across 2019–2024 multi-year validation.
 
 File Structure
 Global parameter configuration: study bounds, scale, phenology DOY defaults
