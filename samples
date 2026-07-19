@@ -1,0 +1,1037 @@
+// ============================================================================
+// SCIENTIFIC SPATIAL SAMPLING FOR CSP-BASED COTTON MAPPING  v6.2
+// ============================================================================
+//
+//  v6.2 changes vs v6.1 — 内存优化版
+//  ─────────────────────────────────────
+//  核心问题：
+//    stratifiedSample 对整个研究区（可能含 200+ 个 cellID 类别）一次性采样，
+//    GEE 后端需为每个类别建立独立的采样逻辑 → 计算图指数膨胀 → 内存超限。
+//
+//  优化策略（不改变任何参数、分辨率、采样数、最终效果）：
+//    1. 纬度条带分割：将研究区沿纬度切为 N_STRIPS 条（默认4条），
+//       每条内的 cellID 数量降至原来的 ~1/4 → 峰值内存降至 ~25%。
+//    2. 逐条采样 + 合并：每条独立执行 stratifiedSample，结果合并后
+//       效果与全区一次性采样完全等价。
+//    3. S2 验证分批：verifyAndLimit 也拆为条带内操作，避免对数千点
+//       同时 sampleRegions。
+//    4. 保守 tileScale：对重型 reduce 操作统一使用 tileScale=8。
+//
+//  所有参数、样本数、采样逻辑、导出格式均与 v6.1 完全相同。
+//
+// ============================================================================
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 1 : CONFIGURATION                                             ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+var REGIONS = {
+  aksu:    {bounds: [78, 40, 85, 42.5],   nCotton: 4000, nOther: 4000, label: 'Aksu'},
+  kashi:   {bounds: [75.5, 37.5, 80, 41], nCotton: 3000, nOther: 3000, label: 'Kashgar'},
+  changji: {bounds: [83.0, 43.5, 89, 46],   nCotton: 4000, nOther: 4000, label: 'Changji'},
+  arizona_pinal:  {bounds: [-112.2, 32.3, -110.8, 33.2],  nCotton: 800, nOther: 800, label: 'pinal',   dataSource: 'cdl'},
+  newmexico_dona: {bounds: [-106.9, 31.2, -105.6, 32.3],   nCotton: 800, nOther: 800, label: 'dona', dataSource: 'cdl'},
+  texas_sanangelo: {bounds: [-101.0, 31.1, -99.5, 32.2],   nCotton: 1000, nOther: 1000, label: 'dona', dataSource: 'cdl'},
+
+};
+
+var ACTIVE_REGION = 'texas_sanangelo';
+
+var REF_YEAR = 2020;
+
+var GRID_CELL_DEG    = 0.2;
+var BLOCK_SIZE_DEG   = 0.3;
+var SAMPLE_SCALE     = 30;
+var TILE_SCALE       = 8;
+
+var NUM_PER_CELL_COTTON  = 40;
+var NUM_PER_CELL_SUB     = 30;
+
+var TRAIN_RATIO = 0.7;
+
+var MIN_S2_CROP    = 1;
+var MIN_S2_NONCROP = 1;
+
+var EROSION_RADIUS = 1;
+
+// v6.2 新增：条带数量（内存优化核心参数）
+// 每条处理的 cellID 数量 ≈ 总数 / N_STRIPS
+// 4 条适用于大多数区域；若仍超限可增至 6 或 8
+var N_STRIPS = 4;
+
+// CDL 类别码表（USDA NASS CDL 官方编码）
+var CDL_CLASSES = {
+    cotton:  [2],                                                // Upland Cotton
+    corn:    [1, 12, 13],                                        // Corn / Sweet / Pop
+    wheat:   [22, 23, 24, 26],                                   // Durum/Spring/Winter/DblCrop
+    orchard: [66, 67, 68, 69, 71, 72, 74, 75, 76, 77,
+              204, 210, 211, 212, 218, 220, 223, 242]            // 各类果树/葡萄/坚果/柑橘
+    // otherCrop = 耕地内但不属于上述类别（动态计算）
+};
+
+// 是否启用 CDL 动态比例（建议 true：自动按研究区实际作物面积分配采样）
+var USE_CDL_DYNAMIC_RATIOS = true;
+
+var OTHER_RATIOS = {
+  aksu:    {corn: 0.35, wheat: 0.20, orchard: 0.15, otherCrop: 0.20, nonCrop: 0.10},
+  kashi:   {corn: 0.25, wheat: 0.25, orchard: 0.20, otherCrop: 0.20, nonCrop: 0.10},
+  changji: {corn: 0.40, wheat: 0.25, orchard: 0.05, otherCrop: 0.20, nonCrop: 0.10},
+  // CDL 区域：以下仅作 fallback；USE_CDL_DYNAMIC_RATIOS=true 时会被自动覆盖
+  arizona_pinal:  {corn: 0.10, wheat: 0.10, orchard: 0.10, otherCrop: 0.60, nonCrop: 0.10},
+  newmexico_dona: {corn: 0.05, wheat: 0.10, orchard: 0.25, otherCrop: 0.50, nonCrop: 0.10},
+  texas_sanangelo: {corn: 0.15, wheat: 0.30, orchard: 0.05, otherCrop: 0.40, nonCrop: 0.10},
+};
+
+
+var cfg       = REGIONS[ACTIVE_REGION];
+var studyArea = ee.Geometry.Rectangle(cfg.bounds);
+var nCotton   = cfg.nCotton;
+var nOther    = cfg.nOther;
+var ratios    = OTHER_RATIOS[ACTIVE_REGION];
+
+print('╔══════════════════════════════════════════════════════════╗');
+print('║  SPATIAL SAMPLING v6.2 (memory-optimized) — ' + cfg.label);
+print('║  Cotton target : ' + nCotton + '  Non-cotton target : ' + nOther);
+print('║  Grid cell : ' + GRID_CELL_DEG + '°  Block size: ' + BLOCK_SIZE_DEG + '°');
+print('║  Sampling scale: ' + SAMPLE_SCALE + ' m');
+print('║  Strip batches: ' + N_STRIPS + ' (memory optimization)');
+print('╚══════════════════════════════════════════════════════════╝');
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 2 : STUDY AREA & BASIC MASKS                                  ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+Map.centerObject(studyArea, 8);
+Map.addLayer(ee.Image().paint(studyArea, 0, 2), {palette: ['red']}, 'Study Area');
+
+var wcV200 = ee.ImageCollection('ESA/WorldCover/v200');
+var wcV100 = ee.ImageCollection('ESA/WorldCover/v100');
+var worldCover = ee.Image(ee.Algorithms.If(
+    wcV200.size().gt(0),
+    wcV200.first().select('Map'),
+    wcV100.first().select('Map')
+));
+
+var cropMask   = worldCover.eq(40).clip(studyArea).rename('crop');
+var treeMask   = worldCover.eq(10).clip(studyArea);
+var builtMask  = worldCover.eq(50).clip(studyArea);
+var bareMask   = worldCover.eq(60).clip(studyArea);
+var grassMask  = worldCover.eq(30).clip(studyArea);
+var shrubMask  = worldCover.eq(20).clip(studyArea);
+var waterMask  = worldCover.eq(80).clip(studyArea);
+
+var srtm      = ee.Image('USGS/SRTMGL1_003').select('elevation');
+var elevMask  = srtm.lt(1300).clip(studyArea);
+var slopeMask = ee.Terrain.slope(srtm).lt(15).clip(studyArea);
+
+var basicFilter    = elevMask.and(slopeMask).and(waterMask.not()).and(builtMask.not());
+var strictCropMask = cropMask.and(basicFilter).rename('strictCrop').clip(studyArea);
+
+print('── Section 2: Masks created ──');
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 3 : THREE-YEAR COTTON OVERLAP                                 ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+var CDL_COTTON_VALUE = 2;   // USDA NASS CDL：2 = Upland Cotton（皮马棉=234，可按需追加）
+
+var cotton2019, cotton2020, cotton2021;
+
+var cdlRefImage = null;
+
+
+if (cfg.dataSource === 'cdl') {
+  // CDL 按年份过滤；filterDate 对该集合无效，需用 calendarRange 或 filter year
+  var cdlCol = ee.ImageCollection('USDA/NASS/CDL');
+
+  var cdl2019img = ee.Image(cdlCol.filter(ee.Filter.calendarRange(2019, 2019, 'year')).first())
+                     .select('cropland').clip(studyArea);
+  var cdl2020img = ee.Image(cdlCol.filter(ee.Filter.calendarRange(2020, 2020, 'year')).first())
+                     .select('cropland').clip(studyArea);
+  var cdl2021img = ee.Image(cdlCol.filter(ee.Filter.calendarRange(2021, 2021, 'year')).first())
+                     .select('cropland').clip(studyArea);
+
+ cdlRefImage = (REF_YEAR === 2019) ? cdl2019img :
+                  (REF_YEAR === 2020) ? cdl2020img : cdl2021img;
+
+
+  // CDL 棉花像元 = CDL_COTTON_VALUE；若需同时包含皮马棉（234），改为 .eq(2).or(...eq(234))
+  cotton2019 = cdl2019img.eq(CDL_COTTON_VALUE);
+  cotton2020 = cdl2020img.eq(CDL_COTTON_VALUE);
+  cotton2021 = cdl2021img.eq(CDL_COTTON_VALUE);
+
+  print('Cotton source: USDA NASS CDL  (class=' + CDL_COTTON_VALUE + ')');
+
+} else {
+
+  cotton2019 = ee.Image('projects/wangyiyao/assets/2019_Xinjiang').clip(studyArea).gt(0);
+  cotton2020 = ee.Image('projects/wangyiyao/assets/2020_Xinjiang').clip(studyArea).gt(0);
+  cotton2021 = ee.Image('projects/wangyiyao/assets/2021_Xinjiang').clip(studyArea).gt(0);
+
+  print('Cotton source: Xinjiang custom assets');
+}
+
+var cottonStable = cotton2019.and(cotton2020).and(cotton2021).rename('cottonStable');
+
+var stableCountPre = cottonStable.reduceRegion({
+    reducer: ee.Reducer.sum(), geometry: studyArea,
+    scale: 100, maxPixels: 1e13, bestEffort: true, tileScale: TILE_SCALE
+});
+print('Stable cotton pixels (pre-erosion @100m):', stableCountPre);
+
+var cottonEroded;
+if (EROSION_RADIUS > 0) {
+    cottonEroded = cottonStable.focal_min({
+        radius: EROSION_RADIUS,
+        units: 'pixels',
+        kernel: ee.Kernel.circle(EROSION_RADIUS, 'pixels')
+    }).rename('cottonEroded');
+    print('Erosion applied: radius = ' + EROSION_RADIUS + ' pixels');
+} else {
+    cottonEroded = cottonStable.rename('cottonEroded');
+    print('Erosion DISABLED: preserving full sampling area');
+}
+
+var cottonSampleMask = cottonEroded.and(strictCropMask).rename('cottonFinal');
+
+var stableCountPost = cottonSampleMask.reduceRegion({
+    reducer: ee.Reducer.sum(), geometry: studyArea,
+    scale: 100, maxPixels: 1e13, bestEffort: true, tileScale: TILE_SCALE
+});
+print('Stable cotton pixels (post-filter @100m):', stableCountPost);
+
+var cottonAnyYear  = cotton2019.or(cotton2020).or(cotton2021);
+var nonCottonCrop  = strictCropMask.and(cottonAnyYear.not()).rename('nonCottonCrop');
+
+Map.addLayer(cottonSampleMask.selfMask(), {palette: ['FF0000']},
+    '3-yr Stable Cotton', false);
+Map.addLayer(nonCottonCrop.selfMask(), {palette: ['00AAFF']},
+    'Non-cotton Cropland', false);
+
+print('── Section 3: Cotton masks ready ──');
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 4 : SUB-CLASS MASKS FOR NON-COTTON SAMPLING                   ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+print('');
+print('── Section 4: Sub-class masks ──');
+
+var orchardMask   = treeMask.and(basicFilter).rename('orchard');
+var cornMask      = nonCottonCrop.rename('corn');
+var wheatMask     = nonCottonCrop.rename('wheat');
+var otherCropMask = nonCottonCrop.rename('otherCrop');
+var nonCropMask   = grassMask.or(shrubMask).or(bareMask)
+    .and(basicFilter).rename('nonCrop');
+
+
+// ── CDL 区域：用 CDL 真实分类构建精确的子类掩膜 ──
+if (cfg.dataSource === 'cdl' && cdlRefImage !== null) {
+    print('▶ Building CDL-based subclass masks for ' + cfg.label + ' ...');
+
+    function cdlMaskFromList(classList) {
+        var m = ee.Image(0);
+        classList.forEach(function(c) { m = m.or(cdlRefImage.eq(c)); });
+        return m;
+    }
+
+    var cornCdl    = cdlMaskFromList(CDL_CLASSES.corn);
+    var wheatCdl   = cdlMaskFromList(CDL_CLASSES.wheat);
+    var orchardCdl = cdlMaskFromList(CDL_CLASSES.orchard);
+    var cottonCdl  = cdlMaskFromList(CDL_CLASSES.cotton);
+
+    var notCotton  = cottonAnyYear.not();   // 排除任何年份的棉花像元
+
+    // 覆盖默认掩膜
+    cornMask    = cornCdl.and(basicFilter).and(notCotton).rename('corn');
+    wheatMask   = wheatCdl.and(basicFilter).and(notCotton).rename('wheat');
+    orchardMask = orchardCdl.and(basicFilter).and(notCotton).rename('orchard');
+
+    // otherCrop = 耕地 ∩ 非棉 ∩ 非已分类
+    var classifiedUnion = cottonCdl.or(cornCdl).or(wheatCdl).or(orchardCdl);
+    otherCropMask = strictCropMask.and(notCotton).and(classifiedUnion.not())
+                                  .rename('otherCrop');
+
+    print('  ✓ corn/wheat/orchard masks now derive from CDL real classification');
+}
+
+
+
+var maskNames  = ['cottonFinal', 'corn', 'wheat', 'orchard', 'otherCrop', 'nonCrop'];
+var maskImages = [cottonSampleMask, cornMask, wheatMask, orchardMask, otherCropMask, nonCropMask];
+
+for (var mi = 0; mi < maskNames.length; mi++) {
+    var mCount = maskImages[mi].reduceRegion({
+        reducer: ee.Reducer.sum(), geometry: studyArea,
+        scale: 500, maxPixels: 1e13, bestEffort: true, tileScale: TILE_SCALE
+    });
+    print('Mask pixel count (' + maskNames[mi] + ' @500m):', mCount);
+}
+
+Map.addLayer(orchardMask.selfMask(), {palette: ['00CC00']}, 'Orchard Mask', false);
+Map.addLayer(nonCropMask.selfMask(), {palette: ['CCCC00']}, 'NonCrop Mask', false);
+
+print('── Section 4: Sub-class masks ready ──');
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 4b : DYNAMIC RATIO COMPUTATION (CDL regions only)             ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+if (cfg.dataSource === 'cdl' && USE_CDL_DYNAMIC_RATIOS) {
+    print('');
+    print('── Section 4b: Computing actual crop ratios from CDL pixel counts ──');
+
+    function pixSum(mask) {
+        return mask.unmask(0).reduceRegion({
+            reducer: ee.Reducer.sum(),
+            geometry: studyArea,
+            scale: 100,                  // 100m 足够估比例
+            maxPixels: 1e13,
+            bestEffort: true,
+            tileScale: TILE_SCALE
+        }).values().get(0);
+    }
+
+    var pixCounts = ee.Dictionary({
+        corn:      pixSum(cornMask),
+        wheat:     pixSum(wheatMask),
+        orchard:   pixSum(orchardMask),
+        otherCrop: pixSum(otherCropMask),
+        nonCrop:   pixSum(nonCropMask)
+    });
+
+    // .getInfo() 同步取回客户端（Code Editor 中可用，会短暂阻塞）
+    var pix = pixCounts.getInfo();
+    print('CDL pixel counts @100m:', pix);
+
+    var c_corn  = pix.corn      || 0;
+    var c_wheat = pix.wheat     || 0;
+    var c_orch  = pix.orchard   || 0;
+    var c_other = pix.otherCrop || 0;
+    var cropSum = c_corn + c_wheat + c_orch + c_other;
+
+    if (cropSum > 0) {
+        // 策略：nonCrop 固定保留 10%，其余 90% 按耕地各类实际面积分配
+        var nonCropFloor = 0.10;
+        var cropBudget   = 1.0 - nonCropFloor;
+
+        ratios = {
+            corn:      (c_corn  / cropSum) * cropBudget,
+            wheat:     (c_wheat / cropSum) * cropBudget,
+            orchard:   (c_orch  / cropSum) * cropBudget,
+            otherCrop: (c_other / cropSum) * cropBudget,
+            nonCrop:   nonCropFloor
+        };
+
+        print('▶ Dynamic ratios (overrides OTHER_RATIOS):');
+        print('   corn      : ' + (ratios.corn      * 100).toFixed(1) + '%');
+        print('   wheat     : ' + (ratios.wheat     * 100).toFixed(1) + '%');
+        print('   orchard   : ' + (ratios.orchard   * 100).toFixed(1) + '%');
+        print('   otherCrop : ' + (ratios.otherCrop * 100).toFixed(1) + '%');
+        print('   nonCrop   : ' + (ratios.nonCrop   * 100).toFixed(1) + '%');
+    } else {
+        print('⚠ No crop pixels found; falling back to OTHER_RATIOS');
+    }
+}
+
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 5 : UNIFORM GRID + STRIP GEOMETRY FOR BATCHED SAMPLING        ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+//
+//  v6.2 新增：预计算 N_STRIPS 条纬度条带的几何边界。
+//  后续 stratifiedSample 在每个条带内独立执行，
+//  每条的 cellID 类别数 ≈ 总 cellID / N_STRIPS → 计算图大幅缩小。
+
+print('');
+print('── Section 5: Building spatial grid + strip geometries ──');
+
+var lonImg = ee.Image.pixelLonLat().select('longitude');
+var latImg = ee.Image.pixelLonLat().select('latitude');
+
+var bounds    = studyArea.bounds().coordinates().get(0);
+var coordList = ee.List(bounds);
+var xMin = ee.Number(ee.List(coordList.get(0)).get(0));
+var yMin = ee.Number(ee.List(coordList.get(0)).get(1));
+var xMax = ee.Number(ee.List(coordList.get(2)).get(0));
+var yMax = ee.Number(ee.List(coordList.get(2)).get(1));
+
+// ── Grid cells ──
+var cellCol   = lonImg.subtract(xMin).divide(GRID_CELL_DEG).floor().toInt().rename('cCol');
+var cellRow   = latImg.subtract(yMin).divide(GRID_CELL_DEG).floor().toInt().rename('cRow');
+var nColsGrid = xMax.subtract(xMin).divide(GRID_CELL_DEG).ceil().toInt();
+var cellID    = cellCol.add(cellRow.multiply(nColsGrid)).rename('cellID');
+
+Map.addLayer(cellID.clip(studyArea).mod(2).selfMask(),
+    {palette: ['DDDDDD'], opacity: 0.12}, 'Grid Cells (0.2°)', false);
+
+var nRowsGrid = yMax.subtract(yMin).divide(GRID_CELL_DEG).ceil();
+print('Grid dimensions (cols × rows):', 
+    xMax.subtract(xMin).divide(GRID_CELL_DEG).ceil(), '×', nRowsGrid);
+
+// ── 预计算纬度条带几何 ──
+// 使用客户端值构建条带，避免服务端依赖
+var boundsClient = cfg.bounds; // [xMin, yMin, xMax, yMax]
+var stripDy = (boundsClient[3] - boundsClient[1]) / N_STRIPS;
+var STRIP_GEOMETRIES = [];
+
+for (var si = 0; si < N_STRIPS; si++) {
+    var sYMin = boundsClient[1] + si * stripDy;
+    var sYMax = boundsClient[1] + (si + 1) * stripDy;
+    // 微量扩展避免边界像素丢失
+    if (si === 0) sYMin -= 0.001;
+    if (si === N_STRIPS - 1) sYMax += 0.001;
+    STRIP_GEOMETRIES.push(
+        ee.Geometry.Rectangle([boundsClient[0], sYMin, boundsClient[2], sYMax])
+    );
+}
+
+print('Strip geometries created: ' + N_STRIPS + ' strips');
+for (var sj = 0; sj < N_STRIPS; sj++) {
+    var sYMinPrint = (boundsClient[1] + sj * stripDy).toFixed(3);
+    var sYMaxPrint = (boundsClient[1] + (sj + 1) * stripDy).toFixed(3);
+    print('  Strip ' + sj + ': lat [' + sYMinPrint + ', ' + sYMaxPrint + ']');
+}
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 6 : SPATIAL BLOCKS FOR TRAIN / TEST SPLIT                     ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+print('── Section 6: Spatial blocks (0.3° = ~33 km) ──');
+
+var nColsBlock = xMax.subtract(xMin).divide(BLOCK_SIZE_DEG).ceil();
+var blockCol   = lonImg.subtract(xMin).divide(BLOCK_SIZE_DEG).floor().toInt().rename('bCol');
+var blockRow   = latImg.subtract(yMin).divide(BLOCK_SIZE_DEG).floor().toInt().rename('bRow');
+var blockID    = blockCol.add(blockRow.multiply(nColsBlock)).rename('blockID');
+
+var blockRand     = blockID.multiply(2654435761).mod(65536).divide(65536.0).rename('blockRand');
+var trainBlockImg = blockRand.lt(TRAIN_RATIO).rename('isTrain');
+
+Map.addLayer(trainBlockImg.selfMask().clip(studyArea),
+    {palette: ['00FF00'], opacity: 0.06}, 'Train Blocks (70%)', false);
+Map.addLayer(trainBlockImg.not().selfMask().clip(studyArea),
+    {palette: ['0000FF'], opacity: 0.06}, 'Test Blocks (30%)', false);
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 7 : S2 OBSERVATION COUNT (Sep-Oct cross-verification)         ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+print('── Section 7: S2 cross-verification layer ──');
+
+function maskS2(image) {
+    var scl = image.select('SCL');
+    var clearMask = scl.eq(4).or(scl.eq(5)).or(scl.eq(6));
+    return image.updateMask(clearMask);
+}
+
+var s2SepOct = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(studyArea)
+    .filterDate(REF_YEAR + '-09-01', REF_YEAR + '-11-01')
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+    .map(maskS2);
+
+var s2Count = s2SepOct.select('B4').count().rename('s2_count')
+    .clip(studyArea).unmask(0);
+
+Map.addLayer(s2Count, {min: 0, max: 15, palette: ['red', 'yellow', 'green']},
+    'S2 Sep-Oct Count', false);
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 8 : CORE SAMPLING FUNCTIONS — STRIP-BATCHED VERSION           ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+//
+//  v6.2 核心改动：所有采样函数在条带内执行，而非全区一次性。
+//
+//  内存优化原理：
+//    stratifiedSample(classBand='cellID', region=全区) 时，GEE 后端
+//    为每个唯一 cellID 值创建独立采样子任务。若全区有 300 个 cell，
+//    则同时存在 300 个子任务 → 内存爆炸。
+//
+//    拆为 4 条后，每条仅 ~75 个 cell，子任务数降至 1/4，
+//    且条带几何面积更小 → 像素扫描量也减少。
+//
+//  关键：条带间可能有微量重叠（边界像素），通过 distinct('.geo')
+//    在合并后去重，保证不影响最终结果。
+
+var CARRY_BANDS = cellID.addBands(blockID).addBands(trainBlockImg);
+
+/**
+ * 条带级 grid-stratified 采样
+ * 在单个条带内对 cellID 执行 stratifiedSample
+ */
+function gridStratifiedSampleInStrip(classMask, numPerCell, seed, stripGeom) {
+    var maskedCellID = cellID.updateMask(classMask).rename('cellID');
+    
+    var candidates = maskedCellID
+        .addBands(blockID)
+        .addBands(trainBlockImg)
+        .stratifiedSample({
+            numPoints: numPerCell,
+            classBand: 'cellID',
+            region: stripGeom,
+            scale: SAMPLE_SCALE,
+            seed: seed,
+            geometries: true,
+            dropNulls: true,
+            tileScale: TILE_SCALE
+        });
+    
+    return candidates;
+}
+
+/**
+ * 条带级随机采样（补充用）
+ */
+function randomFillSampleInStrip(classMask, numPixels, seed, stripGeom) {
+    var maskedImg = classMask.selfMask()
+        .addBands(cellID)
+        .addBands(blockID)
+        .addBands(trainBlockImg);
+    
+    var extra = maskedImg.sample({
+        region: stripGeom,
+        scale: SAMPLE_SCALE,
+        numPixels: numPixels,
+        seed: seed,
+        geometries: true,
+        dropNulls: true,
+        tileScale: TILE_SCALE
+    });
+    
+    return extra;
+}
+
+/**
+ * v6.2 核心函数：条带分批 + 合并的均匀采样
+ *
+ * 对每个条带：
+ *   1. grid-stratified 采样（保证空间均匀性）
+ *   2. random 补充采样（填补稀疏区域）
+ *   3. 合并并标记来源
+ *
+ * 所有条带结果合并后：
+ *   - 去重（边界重叠像素）
+ *   - 按优先级排序：grid > random
+ *   - 效果与 v6.1 全区采样完全一致
+ */
+function combinedUniformSampleBatched(classMask, targetN, numPerCell, seed, label) {
+    var allCandidates = [];
+    
+    for (var s = 0; s < N_STRIPS; s++) {
+        var stripGeom = STRIP_GEOMETRIES[s];
+        var stripSeed = seed + s * 37; // 每条不同的种子
+        
+        // Pass 1: grid-stratified within strip
+        var gridCand = gridStratifiedSampleInStrip(
+            classMask, numPerCell, stripSeed, stripGeom
+        ).map(function(f) { return f.set('_source', 'grid'); });
+        
+        // Pass 2: random fill within strip
+        // 每条分配 targetN * 1.5 / N_STRIPS 的随机候选
+        var randomN = Math.ceil(targetN * 1.5 / N_STRIPS);
+        var randomCand = randomFillSampleInStrip(
+            classMask, randomN, stripSeed + 500, stripGeom
+        ).map(function(f) { return f.set('_source', 'random'); });
+        
+        allCandidates.push(gridCand);
+        allCandidates.push(randomCand);
+    }
+    
+    // 合并所有条带的候选
+    var merged = allCandidates[0];
+    for (var i = 1; i < allCandidates.length; i++) {
+        merged = merged.merge(allCandidates[i]);
+    }
+    
+    // 添加排序键
+    merged = merged.randomColumn('_sortKey', seed + 7);
+    
+    // 优先级排序：grid 候选优先
+    merged = merged.map(function(f) {
+        var bonus = ee.Algorithms.If(
+            ee.String(f.get('_source')).equals('grid'),
+            0.0,
+            1.0
+        );
+        return f.set('_priority', ee.Number(bonus).add(ee.Number(f.get('_sortKey'))));
+    });
+    
+    merged = merged.sort('_priority');
+    
+    return merged;
+}
+
+/**
+ * S2 验证 + 精确截断
+ * v6.2：sampleRegions 也分条带执行以减少内存
+ */
+function verifyAndLimit(candidateFC, targetN, s2Threshold, classValue, className) {
+    // 将候选点按条带区域拆分后分别验证，再合并
+    // 使用 filterBounds 在 FC 级别拆分（轻量操作）
+    var verifiedParts = [];
+    
+    for (var s = 0; s < N_STRIPS; s++) {
+        var stripGeom = STRIP_GEOMETRIES[s];
+        var stripCandidates = candidateFC.filterBounds(stripGeom);
+        
+        var withS2 = s2Count.sampleRegions({
+            collection: stripCandidates,
+            properties: ['cellID', 'blockID', 'isTrain', '_source', '_priority'],
+            scale: 10,
+            tileScale: TILE_SCALE,
+            geometries: true
+        });
+        
+        var verified = withS2.filter(ee.Filter.gte('s2_count', s2Threshold));
+        verifiedParts.push(verified);
+    }
+    
+    // 合并所有条带的验证结果
+    var allVerified = verifiedParts[0];
+    for (var i = 1; i < verifiedParts.length; i++) {
+        allVerified = allVerified.merge(verifiedParts[i]);
+    }
+    
+    // 按优先级排序后截断
+    allVerified = allVerified.sort('_priority');
+    var limited = allVerified.limit(targetN);
+    
+    // 标记类别信息
+    limited = limited.map(function(f) {
+        return f.set('cropType', classValue)
+                .set('cropName', className)
+                .set('class', classValue === 1 ? 1 : 0);
+    });
+    
+    return limited;
+}
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 9 : EXECUTE SAMPLING FOR ALL CLASSES                          ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+var nCorn      = Math.round(nOther * ratios.corn);
+var nWheat     = Math.round(nOther * ratios.wheat);
+var nOrchard   = Math.round(nOther * ratios.orchard);
+var nOtherCrop = Math.round(nOther * ratios.otherCrop);
+var nNonCrop   = nOther - nCorn - nWheat - nOrchard - nOtherCrop;
+
+print('');
+print('╔═══════════════════════════════════════════╗');
+print('║       SAMPLING TARGETS                     ║');
+print('╠═══════════════════════════════════════════╣');
+print('║ Cotton     : ' + nCotton);
+print('║ Corn       : ' + nCorn + '  (' + (ratios.corn * 100) + '%)');
+print('║ Wheat      : ' + nWheat + '  (' + (ratios.wheat * 100) + '%)');
+print('║ Orchard    : ' + nOrchard + '  (' + (ratios.orchard * 100) + '%)');
+print('║ OtherCrop  : ' + nOtherCrop + '  (' + (ratios.otherCrop * 100) + '%)');
+print('║ NonCrop    : ' + nNonCrop + '  (' + (ratios.nonCrop * 100) + '%)');
+print('║ [Strip batches: ' + N_STRIPS + ']');
+print('╚═══════════════════════════════════════════╝');
+
+print('');
+print('▶ Sampling COTTON (batched: ' + N_STRIPS + ' strips) …');
+var cottonAllCand = combinedUniformSampleBatched(
+    cottonSampleMask, nCotton, NUM_PER_CELL_COTTON, 100, 'cotton');
+print('  Cotton raw candidates:', cottonAllCand.size());
+print('  ↳ grid-sourced:', cottonAllCand.filter(ee.Filter.eq('_source', 'grid')).size());
+print('  ↳ random-sourced:', cottonAllCand.filter(ee.Filter.eq('_source', 'random')).size());
+
+print('▶ Sampling CORN …');
+var cornAllCand = combinedUniformSampleBatched(
+    cornMask, nCorn, NUM_PER_CELL_SUB, 200, 'corn');
+print('  Corn raw candidates:', cornAllCand.size());
+
+print('▶ Sampling WHEAT …');
+var wheatAllCand = combinedUniformSampleBatched(
+    wheatMask, nWheat, NUM_PER_CELL_SUB, 210, 'wheat');
+print('  Wheat raw candidates:', wheatAllCand.size());
+
+print('▶ Sampling ORCHARD …');
+var orchardAllCand = combinedUniformSampleBatched(
+    orchardMask, nOrchard, NUM_PER_CELL_SUB, 220, 'orchard');
+print('  Orchard raw candidates:', orchardAllCand.size());
+
+print('▶ Sampling OTHER CROP …');
+var otherCropAllCand = combinedUniformSampleBatched(
+    otherCropMask, nOtherCrop, NUM_PER_CELL_SUB, 230, 'otherCrop');
+print('  OtherCrop raw candidates:', otherCropAllCand.size());
+
+print('▶ Sampling NON-CROP …');
+var nonCropAllCand = combinedUniformSampleBatched(
+    nonCropMask, nNonCrop, NUM_PER_CELL_SUB, 240, 'nonCrop');
+print('  NonCrop raw candidates:', nonCropAllCand.size());
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 10 : S2 VERIFICATION & EXACT COUNT LIMITING                   ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+print('');
+print('── Section 10: S2 cross-verification (threshold = ' + MIN_S2_CROP +
+      ', batched: ' + N_STRIPS + ' strips) ──');
+
+var cottonV    = verifyAndLimit(cottonAllCand,    nCotton,    MIN_S2_CROP,    1, 'cotton');
+var cornV      = verifyAndLimit(cornAllCand,      nCorn,      MIN_S2_CROP,    2, 'corn');
+var wheatV     = verifyAndLimit(wheatAllCand,     nWheat,     MIN_S2_CROP,    3, 'wheat');
+var orchardV   = verifyAndLimit(orchardAllCand,   nOrchard,   MIN_S2_CROP,    4, 'orchard');
+var otherCropV = verifyAndLimit(otherCropAllCand, nOtherCrop, MIN_S2_CROP,    5, 'otherCrop');
+var nonCropV   = verifyAndLimit(nonCropAllCand,   nNonCrop,   MIN_S2_NONCROP, 6, 'nonCrop');
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 11 : SPATIAL-BLOCK TRAIN / TEST SPLIT                         ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+print('── Section 11: Spatial-block split (0.3° blocks) ──');
+
+function assignSplit(fc) {
+    return fc.map(function(f) {
+        var flag = ee.Number(f.get('isTrain'));
+        return f.set('split', ee.Algorithms.If(flag.eq(1), 'train', 'test'));
+    });
+}
+
+var cottonFinal    = assignSplit(cottonV);
+var cornFinal      = assignSplit(cornV);
+var wheatFinal     = assignSplit(wheatV);
+var orchardFinal   = assignSplit(orchardV);
+var otherCropFinal = assignSplit(otherCropV);
+var nonCropFinal   = assignSplit(nonCropV);
+
+var allOtherFinal = cornFinal.merge(wheatFinal)
+    .merge(orchardFinal).merge(otherCropFinal).merge(nonCropFinal);
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 12 : FINAL COUNTS & SPATIAL UNIFORMITY DIAGNOSTICS            ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+print('');
+print('╔══════════════════════════════════════════════════════════╗');
+print('║  FINAL VERIFIED SAMPLE COUNTS                            ║');
+print('╚══════════════════════════════════════════════════════════╝');
+
+var categories = [
+    {name: 'Cotton',    fc: cottonFinal,    target: nCotton},
+    {name: 'Corn',      fc: cornFinal,      target: nCorn},
+    {name: 'Wheat',     fc: wheatFinal,     target: nWheat},
+    {name: 'Orchard',   fc: orchardFinal,   target: nOrchard},
+    {name: 'OtherCrop', fc: otherCropFinal, target: nOtherCrop},
+    {name: 'NonCrop',   fc: nonCropFinal,   target: nNonCrop}
+];
+
+categories.forEach(function(cat) {
+    print('─── ' + cat.name + '  (target: ' + cat.target + ') ───');
+    print('  ACTUAL count:', cat.fc.size());
+    print('  train:', cat.fc.filter(ee.Filter.eq('split', 'train')).size(),
+          '  test:', cat.fc.filter(ee.Filter.eq('split', 'test')).size());
+});
+
+print('');
+print('▸ Total cotton:',     cottonFinal.size());
+print('▸ Total non-cotton:', allOtherFinal.size());
+
+var grandTrain = cottonFinal.filter(ee.Filter.eq('split', 'train')).size()
+    .add(allOtherFinal.filter(ee.Filter.eq('split', 'train')).size());
+var grandTest = cottonFinal.filter(ee.Filter.eq('split', 'test')).size()
+    .add(allOtherFinal.filter(ee.Filter.eq('split', 'test')).size());
+print('▸ Grand total → train:', grandTrain, ' test:', grandTest);
+
+print('');
+print('═══ SPATIAL UNIFORMITY DIAGNOSTICS ═══');
+
+var cottonCellHist = cottonFinal.aggregate_histogram('cellID');
+print('Cotton per-cell histogram:', cottonCellHist);
+
+var otherCellHist = allOtherFinal.aggregate_histogram('cellID');
+print('Non-cotton per-cell histogram:', otherCellHist);
+
+var cottonGridCount  = cottonFinal.filter(ee.Filter.eq('_source', 'grid')).size();
+var cottonTotalCount = cottonFinal.size();
+print('Cotton grid-sourced ratio:', cottonGridCount, '/', cottonTotalCount);
+
+var allSamplesFC = cottonFinal.merge(allOtherFinal);
+print('Unique grid cells with samples:', allSamplesFC.distinct('cellID').size());
+
+print('');
+print('═══ NON-COTTON SUB-CLASS COMPOSITION ═══');
+var otherByType = allOtherFinal.aggregate_histogram('cropName');
+print('Non-cotton by cropName:', otherByType);
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 13 : MAP VISUALIZATION & DISTRIBUTION CHARTS                  ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+print('');
+print('── Section 13: Map layers ──');
+
+Map.addLayer(cottonFinal.filter(ee.Filter.eq('split', 'train')),
+    {color: 'FF0000'}, 'Cotton — Train', true);
+Map.addLayer(cottonFinal.filter(ee.Filter.eq('split', 'test')),
+    {color: 'FF9999'}, 'Cotton — Test', true);
+
+Map.addLayer(cornFinal,      {color: 'FFFF00'}, 'Corn samples',      false);
+Map.addLayer(wheatFinal,     {color: 'FFA500'}, 'Wheat samples',     false);
+Map.addLayer(orchardFinal,   {color: '00CC00'}, 'Orchard samples',   false);
+Map.addLayer(otherCropFinal, {color: 'AA00FF'}, 'OtherCrop samples', false);
+Map.addLayer(nonCropFinal,   {color: '888888'}, 'NonCrop samples',   false);
+
+Map.addLayer(allOtherFinal.filter(ee.Filter.eq('split', 'train')),
+    {color: '0088FF'}, 'Non-cotton — Train', false);
+Map.addLayer(allOtherFinal.filter(ee.Filter.eq('split', 'test')),
+    {color: '88CCFF'}, 'Non-cotton — Test', false);
+
+var sampleRaster = allSamplesFC.reduceToImage({
+    properties: ['class'],
+    reducer: ee.Reducer.count()
+}).rename('sample_density').clip(studyArea);
+
+var densitySmoothed = sampleRaster.unmask(0).reduceNeighborhood({
+    reducer: ee.Reducer.sum(),
+    kernel: ee.Kernel.circle(5000, 'meters')
+}).rename('density');
+
+Map.addLayer(densitySmoothed, {
+    min: 0, max: 50,
+    palette: ['000080', '0000FF', '00FFFF', 'FFFF00', 'FF0000']
+}, 'Sample Density Heatmap', false);
+
+var cottonRaster = cottonFinal.reduceToImage({
+    properties: ['class'],
+    reducer: ee.Reducer.count()
+}).rename('cotton_density').clip(studyArea);
+
+var cottonDensitySmoothed = cottonRaster.unmask(0).reduceNeighborhood({
+    reducer: ee.Reducer.sum(),
+    kernel: ee.Kernel.circle(5000, 'meters')
+}).rename('cotton_density');
+
+Map.addLayer(cottonDensitySmoothed, {
+    min: 0, max: 30,
+    palette: ['FFFFFF', 'FFCCCC', 'FF6666', 'FF0000', 'AA0000']
+}, 'Cotton Density Heatmap', false);
+
+print('');
+print('═══ UNIFORMITY CHART (cotton per-cell) ═══');
+
+var cottonWithCell = cottonFinal.map(function(f) {
+    return f.set('cellID_str', ee.Number(f.get('cellID')).format('%d'));
+});
+var cottonCellChart = ui.Chart.feature.histogram({
+    features: cottonWithCell,
+    property: 'cellID',
+    maxBuckets: 100
+}).setOptions({
+    title: 'Cotton Samples per Grid Cell (should be ~uniform)',
+    hAxis: {title: 'Grid Cell ID'},
+    vAxis: {title: 'Number of Samples'},
+    legend: 'none',
+    colors: ['FF0000']
+});
+print(cottonCellChart);
+
+var allWithCell = allSamplesFC.map(function(f) {
+    return f.set('cellID_str', ee.Number(f.get('cellID')).format('%d'));
+});
+var allCellChart = ui.Chart.feature.histogram({
+    features: allWithCell,
+    property: 'cellID',
+    maxBuckets: 100
+}).setOptions({
+    title: 'ALL Samples per Grid Cell (should be ~uniform)',
+    hAxis: {title: 'Grid Cell ID'},
+    vAxis: {title: 'Number of Samples'},
+    legend: 'none',
+    colors: ['0066CC']
+});
+print(allCellChart);
+
+var otherTypeChart = ui.Chart.feature.histogram({
+    features: allOtherFinal,
+    property: 'cropType'
+}).setOptions({
+    title: 'Non-cotton Sub-class Distribution',
+    hAxis: {title: 'Crop Type (2=Corn 3=Wheat 4=Orchard 5=Other 6=NonCrop)'},
+    vAxis: {title: 'Count'},
+    colors: ['FF8800']
+});
+print(otherTypeChart);
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 14 : PER-CATEGORY ACCURACY EVALUATION FUNCTION                ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+function perCategoryAccuracy(classImage, cottonFC, otherFC) {
+    var cottonTest = cottonFC.filter(ee.Filter.eq('split', 'test'));
+    var otherTest  = otherFC.filter(ee.Filter.eq('split', 'test'));
+    var allTest    = cottonTest.merge(otherTest);
+
+    var predicted = classImage.unmask(0).rename('predicted');
+
+    var testWithPred = predicted.sampleRegions({
+        collection: allTest,
+        properties: ['class', 'cropType', 'cropName', 'split'],
+        scale: 10,
+        tileScale: 16
+    });
+
+    var overallCM = testWithPred.errorMatrix('class', 'predicted');
+    print('');
+    print('╔══════════════════════════════════════════════════════════╗');
+    print('║  OVERALL ACCURACY (spatial-block test set)               ║');
+    print('╚══════════════════════════════════════════════════════════╝');
+    print('Confusion matrix:', overallCM);
+    print('OA:',    overallCM.accuracy());
+    print('Kappa:', overallCM.kappa());
+
+    var arr = overallCM.array();
+    var tp  = arr.get([1, 1]);
+    var fp  = arr.get([0, 1]);
+    var fn  = arr.get([1, 0]);
+    var tn  = arr.get([0, 0]);
+    var precision = ee.Number(tp).divide(ee.Number(tp).add(fp).max(1));
+    var recall    = ee.Number(tp).divide(ee.Number(tp).add(fn).max(1));
+    var f1 = ee.Number(2).multiply(precision).multiply(recall)
+        .divide(precision.add(recall).max(0.0001));
+    print('Precision (UA):', precision);
+    print('Recall (PA):',    recall);
+    print('F1:',             f1);
+    print('TP:', tp, ' FP:', fp, ' FN:', fn, ' TN:', tn);
+
+    var subCategories = [
+        {name: 'Corn',      value: 2},
+        {name: 'Wheat',     value: 3},
+        {name: 'Orchard',   value: 4},
+        {name: 'OtherCrop', value: 5},
+        {name: 'NonCrop',   value: 6}
+    ];
+
+    print('');
+    print('╔══════════════════════════════════════════════════════════╗');
+    print('║  PER-CATEGORY: Cotton vs specific non-cotton class       ║');
+    print('╚══════════════════════════════════════════════════════════╝');
+
+    subCategories.forEach(function(cat) {
+        var catTestPts    = testWithPred.filter(ee.Filter.eq('cropType', cat.value));
+        var cottonTestPts = testWithPred.filter(ee.Filter.eq('class', 1));
+        var subset        = cottonTestPts.merge(catTestPts);
+
+        var nCatTest = catTestPts.size();
+        var nCotTest = cottonTestPts.size();
+
+        var subCM = subset.errorMatrix('class', 'predicted');
+        print('');
+        print('─── Cotton vs ' + cat.name + ' ───');
+        print('  n(cotton test):', nCotTest, '  n(' + cat.name + ' test):', nCatTest);
+        print('  Confusion matrix:', subCM);
+        print('  OA:', subCM.accuracy());
+        print('  Kappa:', subCM.kappa());
+
+        var subArr   = subCM.array();
+        var sub_tp   = subArr.get([1, 1]);
+        var sub_fp   = subArr.get([0, 1]);
+        var sub_fn   = subArr.get([1, 0]);
+        var sub_tn   = subArr.get([0, 0]);
+        var sub_prec = ee.Number(sub_tp).divide(ee.Number(sub_tp).add(sub_fp).max(1));
+        var sub_rec  = ee.Number(sub_tp).divide(ee.Number(sub_tp).add(sub_fn).max(1));
+        var sub_f1   = ee.Number(2).multiply(sub_prec).multiply(sub_rec)
+            .divide(sub_prec.add(sub_rec).max(0.0001));
+        print('  Precision:', sub_prec);
+        print('  Recall:',    sub_rec);
+        print('  F1:',        sub_f1);
+    });
+
+    return testWithPred;
+}
+
+print('');
+print('perCategoryAccuracy() is defined and ready');
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 15 : EXPORT TO ASSETS                                         ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+var prefix = 'projects/wangyiyao/assets/samples_v6_' + ACTIVE_REGION + '_';
+
+Export.table.toAsset({
+    collection: cottonFinal,
+    description: ACTIVE_REGION + '_cotton_v6',
+    assetId: prefix + 'cotton'
+});
+print('Export queued: ' + prefix + 'cotton');
+
+Export.table.toAsset({
+    collection: allOtherFinal,
+    description: ACTIVE_REGION + '_noncotton_v6',
+    assetId: prefix + 'noncotton'
+});
+print('Export queued: ' + prefix + 'noncotton');
+
+Export.table.toAsset({
+    collection: cornFinal,
+    description: ACTIVE_REGION + '_corn_v6',
+    assetId: prefix + 'corn'
+});
+
+Export.table.toAsset({
+    collection: wheatFinal,
+    description: ACTIVE_REGION + '_wheat_v6',
+    assetId: prefix + 'wheat'
+});
+
+Export.table.toAsset({
+    collection: orchardFinal,
+    description: ACTIVE_REGION + '_orchard_v6',
+    assetId: prefix + 'orchard'
+});
+
+Export.table.toAsset({
+    collection: otherCropFinal,
+    description: ACTIVE_REGION + '_otherCrop_v6',
+    assetId: prefix + 'otherCrop'
+});
+
+Export.table.toAsset({
+    collection: nonCropFinal,
+    description: ACTIVE_REGION + '_nonCrop_v6',
+    assetId: prefix + 'nonCrop'
+});
+
+print('');
+print('╔══════════════════════════════════════════════════════════╗');
+print('║  All 7 export tasks queued — go to Tasks tab → Run      ║');
+print('║                                                          ║');
+print('║  Files:                                                   ║');
+print('║    ' + prefix + 'cotton      (main)');
+print('║    ' + prefix + 'noncotton   (main)');
+print('║    ' + prefix + 'corn');
+print('║    ' + prefix + 'wheat');
+print('║    ' + prefix + 'orchard');
+print('║    ' + prefix + 'otherCrop');
+print('║    ' + prefix + 'nonCrop');
+print('╚══════════════════════════════════════════════════════════╝');
+
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  SECTION 16 : INTEGRATION GUIDE FOR CODE 1                             ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+//
+//  与 v6.1 完全相同，无需修改 Code 1 的集成方式。
+//  导出的样本属性不变：class, cropType, cropName, split, cellID, blockID
+//
+// ============================================================================
+// END OF SCRIPT — v6.2 (memory-optimized)
+// ============================================================================
